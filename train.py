@@ -11,14 +11,17 @@
 
 import os
 import torch
+import torch.nn.functional as F
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
+from scene.cameras import Camera
 from utils.general_utils import safe_state, get_expon_lr_func
 import uuid
 from tqdm import tqdm
+from pathlib import Path
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
@@ -48,7 +51,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
-    scene = Scene(dataset, gaussians)
+    scene = Scene(dataset, gaussians, semantic_path=dataset.semantic_path)
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -63,7 +66,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE 
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
 
-    viewpoint_stack = scene.getTrainCameras().copy()
+    viewpoint_stack = scene.getTrainCameras(8.0).copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
@@ -71,6 +74,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):
+
+        if iteration == 10000:
+            viewpoint_stack = scene.getTrainCameras(4.0).copy()
+        elif iteration == 15000:
+            viewpoint_stack = scene.getTrainCameras(2.0).copy()
+        elif iteration == 24000:
+            viewpoint_stack = scene.getTrainCameras(1.0).copy()
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
@@ -94,34 +104,52 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
 
-        # Pick a random Camera
-        if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
-            viewpoint_indices = list(range(len(viewpoint_stack)))
         rand_idx = randint(0, len(viewpoint_indices) - 1)
-        viewpoint_cam = viewpoint_stack.pop(rand_idx)
+        viewpoint_cam: Camera = viewpoint_stack.pop(rand_idx)
         vind = viewpoint_indices.pop(rand_idx)
 
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
 
-        bg = torch.rand((3), device="cuda") if opt.random_background else background
-
+        bg = torch.rand((3), device="cuda") 
+        
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
-        if viewpoint_cam.alpha_mask is not None:
-            alpha_mask = viewpoint_cam.alpha_mask.cuda()
-            image *= alpha_mask
+        # Optional masks (alpha or semantic) used only for loss computation
+
+        mask = None
+        if viewpoint_cam.semantic is not None:
+            semantic_image = torch.tensor(viewpoint_cam.semantic).cuda()
+            # Binary semantic mask: non-zero -> 1, zero -> 0
+            mask = (semantic_image != 0).float()
+            
+            # Resize mask to match image dimensions using nearest neighbor interpolation
+            # mask: [H, W], image: [C, H, W]
+            target_h, target_w = image.shape[1], image.shape[2]
+            if mask.shape[0] != target_h or mask.shape[1] != target_w:
+                # Reshape to [1, 1, H, W] for interpolate, then resize
+                mask = mask.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+                mask = F.interpolate(mask, size=(target_h, target_w), mode='nearest')
+                mask = mask.squeeze(0).squeeze(0)  # [H, W]
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image, gt_image)
-        if FUSED_SSIM_AVAILABLE:
-            ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+        if mask is not None:
+            # mask: [H, W], image: [C, H, W] -> need to add channel dimension for broadcasting
+            mask = mask.unsqueeze(0)  # [1, H, W] for broadcasting with [C, H, W]
+            image_for_loss = image * mask
+            gt_for_loss = gt_image * mask
         else:
-            ssim_value = ssim(image, gt_image)
+            image_for_loss = image
+            gt_for_loss = gt_image
+
+        Ll1 = l1_loss(image_for_loss, gt_for_loss)
+        if FUSED_SSIM_AVAILABLE:
+            ssim_value = fused_ssim(image_for_loss.unsqueeze(0), gt_for_loss.unsqueeze(0))
+        else:
+            ssim_value = ssim(image_for_loss, gt_for_loss)
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 

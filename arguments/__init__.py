@@ -26,6 +26,9 @@ class ParamGroup:
                 key = key[1:]
             t = type(value)
             value = value if not fill_none else None 
+            # Handle NoneType by using str type (for optional string arguments)
+            if t == type(None):
+                t = str
             if shorthand:
                 if t == bool:
                     group.add_argument("--" + key, ("-" + key[0:1]), default=value, action="store_true")
@@ -56,6 +59,7 @@ class ModelParams(ParamGroup):
         self.train_test_exp = False
         self.data_device = "cuda"
         self.eval = False
+        self.semantic_path = None
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):

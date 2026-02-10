@@ -14,11 +14,41 @@ import numpy as np
 from utils.graphics_utils import fov2focal
 from PIL import Image
 import cv2
+import os
+from pathlib import Path
+from typing import List
 
 WARNED = False
 
-def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dataset):
+
+class CachedCameras: 
+
+    def __init__(self):
+        # Different Resolution will get a List of NN.Module which is a Camera with different resolution
+        self._cameras = {}
+        self.current_resolution_scale = 1.0
+
+    def getCamera(self, id) -> Camera:
+        return self._cameras[id]
+
+    def addCamera(self, id, camera: Camera):
+        self.cameras[id] = camera
+
+    @property
+    def cached_resolution_scale(self) -> List[Camera]:
+        return self._cameras[self.current_resolution_scale]
+
+    def set_resolution_scale(self, resolution_scale: float):
+        self.current_resolution_scale = resolution_scale
+
+def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dataset, semantic_path = None) -> Camera:
+
     image = Image.open(cam_info.image_path)
+    if semantic_path is not None:
+        semantic = Image.open(os.path.join(semantic_path, Path(cam_info.image_path).stem) + "_species.png")
+        semantic = np.array(semantic) # (H, W)
+    else:
+        semantic = None
 
     if cam_info.depth_path != "":
         try:
@@ -64,13 +94,13 @@ def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dat
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, depth_params=cam_info.depth_params,
                   image=image, invdepthmap=invdepthmap,
                   image_name=cam_info.image_name, uid=id, data_device=args.data_device,
-                  train_test_exp=args.train_test_exp, is_test_dataset=is_test_dataset, is_test_view=cam_info.is_test)
+                  train_test_exp=args.train_test_exp, is_test_dataset=is_test_dataset, is_test_view=cam_info.is_test, semantic=semantic)
 
-def cameraList_from_camInfos(cam_infos, resolution_scale, args, is_nerf_synthetic, is_test_dataset):
+def cameraList_from_camInfos(cam_infos, resolution_scale, args, is_nerf_synthetic, is_test_dataset, semantic_path = None)->List[Camera]:
     camera_list = []
 
     for id, c in enumerate(cam_infos):
-        camera_list.append(loadCam(args, id, c, resolution_scale, is_nerf_synthetic, is_test_dataset))
+        camera_list.append(loadCam(args, id, c, resolution_scale, is_nerf_synthetic, is_test_dataset, semantic_path))
 
     return camera_list
 
