@@ -25,6 +25,7 @@ from pathlib import Path
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+from scene.GPUImageBuffer import GPUImageBufferPacked
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -43,15 +44,26 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
+
+
+MASK_LOSS_MULTIPLIER = torch.tensor([1.0, 1.0, 1.0, 1.0], dtype=torch.float32, device="cuda")
+RESOLUTION_MAP = {
+    -1: 1.0, # default resolution
+}
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
 
     first_iter = 0
-    tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
-    scene = Scene(dataset, gaussians, semantic_path=dataset.semantic_path)
+    scene = Scene(
+        dataset, 
+        gaussians, 
+        semantic_path=dataset.semantic_path, 
+        resolution_scales=list(RESOLUTION_MAP.values())
+    )
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -66,21 +78,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE 
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
 
-    viewpoint_stack = scene.getTrainCameras(8.0).copy()
-    viewpoint_indices = list(range(len(viewpoint_stack)))
+    camera_loader: GPUImageBufferPacked = scene.getTrainCameras(RESOLUTION_MAP[-1])
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):
-
-        if iteration == 10000:
-            viewpoint_stack = scene.getTrainCameras(4.0).copy()
-        elif iteration == 15000:
-            viewpoint_stack = scene.getTrainCameras(2.0).copy()
-        elif iteration == 24000:
-            viewpoint_stack = scene.getTrainCameras(1.0).copy()
+        if iteration in RESOLUTION_MAP.keys():
+            del camera_loader
+            torch.cuda.empty_cache()
+            camera_loader = scene.getTrainCameras(RESOLUTION_MAP[iteration])
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
@@ -104,9 +112,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
 
-        rand_idx = randint(0, len(viewpoint_indices) - 1)
-        viewpoint_cam: Camera = viewpoint_stack.pop(rand_idx)
-        vind = viewpoint_indices.pop(rand_idx)
+        viewpoint_cam: Camera = camera_loader.pop()
 
         # Render
         if (iteration - 1) == debug_from:
@@ -121,10 +127,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         mask = None
         if viewpoint_cam.semantic is not None:
-            semantic_image = torch.tensor(viewpoint_cam.semantic).cuda()
+            if isinstance(viewpoint_cam.semantic, torch.Tensor):
+                semantic_image = viewpoint_cam.semantic.detach().clone().to(device="cuda")
+            else:
+                semantic_image = torch.tensor(viewpoint_cam.semantic, device="cuda")
             # Binary semantic mask: non-zero -> 1, zero -> 0
-            mask = (semantic_image != 0).float()
-            
+            mask = MASK_LOSS_MULTIPLIER[semantic_image.long()]
             # Resize mask to match image dimensions using nearest neighbor interpolation
             # mask: [H, W], image: [C, H, W]
             target_h, target_w = image.shape[1], image.shape[2]
@@ -135,7 +143,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 mask = mask.squeeze(0).squeeze(0)  # [H, W]
 
         # Loss
-        gt_image = viewpoint_cam.original_image.cuda()
+        gt_image = viewpoint_cam.original_image.to(torch.float16)/255
         if mask is not None:
             # mask: [H, W], image: [C, H, W] -> need to add channel dimension for broadcasting
             mask = mask.unsqueeze(0)  # [1, H, W] for broadcasting with [C, H, W]
@@ -146,10 +154,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             gt_for_loss = gt_image
 
         Ll1 = l1_loss(image_for_loss, gt_for_loss)
+        # SSIM expects float32; image/gt_image may be float16 from buffer
         if FUSED_SSIM_AVAILABLE:
-            ssim_value = fused_ssim(image_for_loss.unsqueeze(0), gt_for_loss.unsqueeze(0))
+            ssim_value = fused_ssim(image_for_loss.unsqueeze(0), image_for_loss.unsqueeze(0))
         else:
-            ssim_value = ssim(image_for_loss, gt_for_loss)
+            ssim_value = ssim(image_for_loss, image_for_loss)
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
@@ -183,7 +192,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
+            #training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -248,7 +257,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
     # Report test and samples of training set
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
-        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
+        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras(scale=1.0)}, 
                               {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
 
         for config in validation_configs:

@@ -13,11 +13,26 @@ import os
 import random
 import json
 from pathlib import Path
+from scene.cameras import Camera
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
+from scene.GPUImageBuffer import GPUImageBufferPacked
+import torch
+"""
+    The modification is like the following: 
+        - We added an additional buffer loader for different resolution and cameras
+        - We do I/O and training in parallel. 
+        - We maintain a double buffer in GPU, and switch between them
+        - Initially all Images already in RAM
+
+        The reason of doing this is to avoid the overhead of I/O and training. 
+        Since we have low GPU memory, we need to only keep a small buffer in GPU.
+"""
+
+
 
 class Scene:
 
@@ -95,8 +110,24 @@ class Scene:
         with open(os.path.join(self.model_path, "exposure.json"), "w") as f:
             json.dump(exposure_dict, f, indent=2)
 
-    def getTrainCameras(self, scale=1.0):
-        return self.train_cameras[scale]
+    def getTrainCameras(self, scale=1.0)-> GPUImageBufferPacked:
+        # This should directly return one cached camera, not a list
+        buf = GPUImageBufferPacked(
+        self.train_cameras[scale],
+        batch_size=8,
+        img_gpu_dtype=torch.uint8,     # best for IO; convert later if needed
+        mask_gpu_dtype=torch.uint8,
+        semantic_gpu_dtype=None,  # optional VRAM saver
+        )
+        return buf
 
-    def getTestCameras(self, scale=1.0):
-        return self.test_cameras[scale]
+
+    def getTestCameras(self, scale=1.0)-> GPUImageBufferPacked:
+        buf = GPUImageBufferPacked(
+        self.test_cameras[scale],
+        batch_size=8,
+        img_gpu_dtype=torch.uint8,     # best for IO; convert later if needed
+        mask_gpu_dtype=torch.uint8,
+        semantic_gpu_dtype=None,  # optional VRAM saver
+        )
+        return buf
