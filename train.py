@@ -100,6 +100,43 @@ def describe_training_stages(stages: List[TrainingStage]):
             f"  iterations {stage.start_iteration}-{stage.end_iteration}: resolution {stage.label}"
         )
 
+
+def image_to_float01(image: torch.Tensor, device: torch.device) -> torch.Tensor:
+    if image.dtype == torch.uint8:
+        return image.to(device=device, dtype=torch.float32) / 255.0
+    return image.to(device=device, dtype=torch.float32).clamp(0.0, 1.0)
+
+
+def mask_to_float01(mask: torch.Tensor, device: torch.device) -> torch.Tensor:
+    if mask.dtype == torch.uint8:
+        return mask.to(device=device, dtype=torch.float32) / 255.0
+    return mask.to(device=device, dtype=torch.float32).clamp(0.0, 1.0)
+
+
+def composite_with_background(rgb: torch.Tensor, alpha: torch.Tensor, background: torch.Tensor) -> torch.Tensor:
+    return rgb * alpha + background * (1.0 - alpha)
+
+
+def build_training_loss_images(
+    rendered_image: torch.Tensor,
+    viewpoint_cam,
+    default_background: torch.Tensor,
+    use_random_background: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    device = rendered_image.device
+    gt_rgb = image_to_float01(viewpoint_cam.original_image, device=device)
+    alpha_mask = mask_to_float01(viewpoint_cam.alpha_mask, device=device)
+
+    if use_random_background:
+        random_background = torch.rand_like(gt_rgb)
+        pred_image = rendered_image.to(torch.float32) + random_background * (1.0 - alpha_mask)
+        gt_image = composite_with_background(gt_rgb, alpha_mask, random_background)
+        return pred_image, gt_image
+
+    default_background_image = default_background[:, None, None].expand_as(gt_rgb)
+    gt_image = composite_with_background(gt_rgb, alpha_mask, default_background_image)
+    return rendered_image.to(torch.float32), gt_image
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
@@ -117,6 +154,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+    black_background = torch.zeros_like(background)
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
@@ -130,6 +168,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         f"Starting training at resolution {current_stage.label} "
         f"(iterations {current_stage.start_iteration}-{current_stage.end_iteration})."
     )
+    if opt.random_background:
+        print("Training loss uses per-pixel random background compositing.")
 
     camera_loader: GPUImageBufferPacked = scene.getTrainCameras(current_stage.scale)
     ema_loss_for_log = 0.0
@@ -177,14 +217,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if (iteration - 1) == debug_from:
             pipe.debug = True
 
-        bg = torch.rand((3), device="cuda") 
-        
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+        render_background = black_background if opt.random_background else background
+        render_pkg = render(
+            viewpoint_cam,
+            gaussians,
+            pipe,
+            render_background,
+            use_trained_exp=dataset.train_test_exp,
+            separate_sh=SPARSE_ADAM_AVAILABLE,
+        )
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
-        # Keep the loss path in float32; fused_ssim expects Float tensors.
-        image_for_loss = image.to(torch.float32)
-        gt_for_loss = viewpoint_cam.original_image.to(device=image.device, dtype=torch.float32) / 255.0
+        image_for_loss, gt_for_loss = build_training_loss_images(
+            image,
+            viewpoint_cam,
+            background,
+            opt.random_background,
+        )
 
         Ll1 = l1_loss(image_for_loss, gt_for_loss)
         if FUSED_SSIM_AVAILABLE:
@@ -286,7 +335,13 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 psnr_test = 0.0
                 for idx, viewpoint in enumerate(config['cameras']):
                     image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
-                    gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                    gt_rgb = image_to_float01(viewpoint.original_image, device=image.device)
+                    alpha_mask = mask_to_float01(viewpoint.alpha_mask, device=image.device)
+                    gt_image = composite_with_background(
+                        gt_rgb,
+                        alpha_mask,
+                        renderArgs[1][:, None, None].expand_as(gt_rgb),
+                    )
                     if train_test_exp:
                         image = image[..., image.shape[-1] // 2:]
                         gt_image = gt_image[..., gt_image.shape[-1] // 2:]
