@@ -14,21 +14,15 @@ class PackedCameraView:
     zfar: float
     image_width: int
     image_height: int
-    depth_reliable: bool
 
     # CUDA views into packed slabs
     original_image: torch.Tensor          # (3,H,W) view
     alpha_mask: torch.Tensor              # (1,H,W) view
-    semantic: Optional[torch.Tensor]      # (C,H,W) or (H,W) view
 
-    # CUDA small tensors (packed too, optional)
+    # CUDA small tensors (packed too)
     world_view_transform: torch.Tensor    # (4,4)
     projection_matrix: torch.Tensor       # (4,4)
     full_proj_transform: torch.Tensor     # (4,4)
     camera_center: torch.Tensor           # (3,)
-
-    # optional depth (if you want)
-    invdepthmap: Optional[torch.Tensor] = None
-    depth_mask: Optional[torch.Tensor] = None
 
     cpu_camera: Optional[Any] = None

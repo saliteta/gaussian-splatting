@@ -260,6 +260,12 @@ class GaussianModel:
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
         self._opacity = optimizable_tensors["opacity"]
 
+    def reset_densification_state(self):
+        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self.tmp_radii = None
+
     def load_ply(self, path, use_train_test_exp = False):
         plydata = PlyData.read(path)
         if use_train_test_exp:

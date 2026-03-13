@@ -11,3 +11,6 @@
 [submodule "submodules/fused-ssim"]
 	path = submodules/fused-ssim
 	url = https://github.com/rahul-goel/fused-ssim.git
+[submodule "submodules/radegs-rasterization"]
+	path = submodules/radegs-rasterization
+	url = https://github.com/graphdeco-inria/radegs-rasterization.git

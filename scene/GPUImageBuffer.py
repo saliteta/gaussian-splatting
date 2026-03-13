@@ -1,9 +1,7 @@
-import collections
 import random
 import torch
-from typing import List, Optional, Any, Dict, Tuple
+from typing import List, Any, Tuple
 from scene.GPUHelper.pachedCamera import PackedCameraView
-import torch.nn.functional as F
 
 
 class _PackedSlot:
@@ -19,54 +17,11 @@ class _PackedSlot:
         self.pos = 0
         self.pinned_keepalive.clear()
 
-
-def resize_semantic_to_hw(sem: torch.Tensor, H: int, W: int) -> torch.Tensor:
-    """
-    sem: CPU tensor, shape [H,W] or [C,H,W]
-    Returns: CPU tensor resized to [H,W] or [C,H,W] with same dtype.
-    - integer / bool -> nearest
-    - float -> bilinear
-    """
-    if sem.ndim == 2:
-        # [H,W] -> [1,1,H,W] for interpolate
-        sem_in = sem[None, None]
-        is_discrete = (not sem.is_floating_point()) or (sem.dtype == torch.bool)
-        mode = "nearest" if is_discrete else "bilinear"
-        out = F.interpolate(
-            sem_in.float() if mode != "nearest" else sem_in,
-            size=(H, W),
-            mode=mode,
-            align_corners=False if mode == "bilinear" else None,
-        )
-        out = out[0, 0]
-        if sem.dtype != out.dtype:
-            # restore dtype for discrete maps
-            out = out.to(sem.dtype) if is_discrete else out.to(sem.dtype)
-        return out
-
-    if sem.ndim == 3:
-        # [C,H,W] -> [1,C,H,W]
-        sem_in = sem[None]
-        is_discrete = (not sem.is_floating_point()) or (sem.dtype == torch.bool)
-        mode = "nearest" if is_discrete else "bilinear"
-        out = F.interpolate(
-            sem_in.float() if mode != "nearest" else sem_in,
-            size=(H, W),
-            mode=mode,
-            align_corners=False if mode == "bilinear" else None,
-        )
-        out = out[0]
-        if sem.dtype != out.dtype:
-            out = out.to(sem.dtype) if is_discrete else out.to(sem.dtype)
-        return out
-
-    raise ValueError(f"Unsupported semantic ndim={sem.ndim}")
-
 class GPUImageBufferPacked:
     """
-    Double-buffer (2 slots) + packed batch copy for images/masks/semantic.
+    Double-buffer (2 slots) + packed batch copy for images and masks.
 
-    pop() returns one camera view; image/mask/semantic are CUDA views into
+    pop() returns one camera view; image/mask are CUDA views into
     packed slabs.
     """
     def __init__(
@@ -82,7 +37,6 @@ class GPUImageBufferPacked:
         # - torch.float16 saves vs float32
         img_gpu_dtype: torch.dtype = torch.uint8,
         mask_gpu_dtype: torch.dtype = torch.uint8,
-        semantic_gpu_dtype: Optional[torch.dtype] = None,  # if None, keep semantic dtype
     ):
         self.device = torch.device(device)
         self.batch_size = batch_size
@@ -91,7 +45,6 @@ class GPUImageBufferPacked:
 
         self.img_gpu_dtype = img_gpu_dtype
         self.mask_gpu_dtype = mask_gpu_dtype
-        self.semantic_gpu_dtype = semantic_gpu_dtype
 
         self.cameras = cameras_cpu
         self.order = list(range(len(cameras_cpu)))
@@ -165,33 +118,10 @@ class GPUImageBufferPacked:
 
         B = len(cams)
 
-        # ---- Decide semantic shape (optional) ----
-        sem0 = getattr(cams[0], "semantic", None)
-        have_sem = sem0 is not None
-
-        sem_shape = None
-        sem_dtype = None
-        if have_sem:
-            if not torch.is_tensor(sem0):
-                sem0 = torch.as_tensor(sem0)
-            # support [H,W] or [C,H,W]
-            if sem0.ndim == 2:
-                sem_shape = (B, H, W)
-            elif sem0.ndim == 3:
-                Csem = sem0.shape[0]
-                sem_shape = (B, Csem, H, W)
-            else:
-                raise ValueError(f"Unsupported semantic ndim={sem0.ndim}")
-            sem_dtype = sem0.dtype
-
         # ---- Allocate pinned CPU slabs ----
         # Store CPU as uint8 if we want IO-efficient transfer
         img_cpu = torch.empty((B, 3, H, W), dtype=torch.uint8, pin_memory=True)
         msk_cpu = torch.empty((B, 1, H, W), dtype=torch.uint8, pin_memory=True)
-
-        sem_cpu = None
-        if have_sem:
-            sem_cpu = torch.empty(sem_shape, dtype=sem_dtype, pin_memory=True)
 
         # Optional: pack small matrices too (one copy)
         wv_cpu = torch.empty((B, 4, 4), dtype=torch.float32, pin_memory=True)
@@ -199,28 +129,8 @@ class GPUImageBufferPacked:
         fp_cpu = torch.empty((B, 4, 4), dtype=torch.float32, pin_memory=True)
         cc_cpu = torch.empty((B, 3), dtype=torch.float32, pin_memory=True)
 
-        # (Optional) depth slabs
-        have_inv = getattr(cams[0], "invdepthmap", None) is not None
-        inv_cpu = None
-        dm_cpu = None
-        if have_inv:
-            inv0 = cams[0].invdepthmap
-            if not (torch.is_tensor(inv0) and inv0.ndim == 3 and inv0.shape[0] == 1):
-                # expected [1,H,W]
-                raise ValueError("Expected invdepthmap shape [1,H,W] tensor on CPU.")
-            inv_cpu = torch.empty((B, 1, H, W), dtype=inv0.dtype, pin_memory=True)
-            dm0 = getattr(cams[0], "depth_mask", None)
-            if dm0 is not None:
-                dm_cpu = torch.empty((B, 1, H, W), dtype=dm0.dtype, pin_memory=True)
-
         # Keep pinned slabs alive until GPU finished copies
         slot.pinned_keepalive.extend([img_cpu, msk_cpu, wv_cpu, pj_cpu, fp_cpu, cc_cpu])
-        if sem_cpu is not None:
-            slot.pinned_keepalive.append(sem_cpu)
-        if inv_cpu is not None:
-            slot.pinned_keepalive.append(inv_cpu)
-        if dm_cpu is not None:
-            slot.pinned_keepalive.append(dm_cpu)
 
         # ---- Fill slabs (CPU copy into pinned memory) ----
         for i, cam in enumerate(cams):
@@ -230,40 +140,11 @@ class GPUImageBufferPacked:
             img_cpu[i].copy_(img_i, non_blocking=False)
             msk_cpu[i].copy_(msk_i, non_blocking=False)
 
-            # semantic (resize to image H,W if needed)
-            if have_sem:
-                sem_i = getattr(cam, "semantic", None)
-                if sem_i is None:
-                    raise ValueError("Semantic missing in a batch that expects semantic.")
-                if not torch.is_tensor(sem_i):
-                    sem_i = torch.as_tensor(sem_i)
-            
-                sem_i = sem_i.cpu()
-            
-                # sem_i can be [H,W] or [C,H,W]; resize if mismatch
-                if sem_i.ndim == 2:
-                    sh, sw = int(sem_i.shape[0]), int(sem_i.shape[1])
-                elif sem_i.ndim == 3:
-                    sh, sw = int(sem_i.shape[-2]), int(sem_i.shape[-1])
-                else:
-                    raise ValueError(f"Unsupported semantic ndim={sem_i.ndim}")
-            
-                if (sh != H) or (sw != W):
-                    sem_i = resize_semantic_to_hw(sem_i, H, W)
-            
-                # Now shapes should match sem_cpu[i]
-                sem_cpu[i].copy_(sem_i, non_blocking=False)
-
             # matrices
             wv_cpu[i].copy_(cam.world_view_transform.cpu().to(torch.float32))
             pj_cpu[i].copy_(cam.projection_matrix.cpu().to(torch.float32))
             fp_cpu[i].copy_(cam.full_proj_transform.cpu().to(torch.float32))
             cc_cpu[i].copy_(cam.camera_center.cpu().to(torch.float32))
-
-            if have_inv:
-                inv_cpu[i].copy_(cam.invdepthmap.cpu())
-                if dm_cpu is not None and getattr(cam, "depth_mask", None) is not None:
-                    dm_cpu[i].copy_(cam.depth_mask.cpu())
 
         # ---- One big async H2D copy per slab (prefetch stream) ----
         with torch.cuda.stream(self.prefetch_stream):
@@ -276,23 +157,10 @@ class GPUImageBufferPacked:
             if self.mask_gpu_dtype != msk_gpu.dtype:
                 msk_gpu = msk_gpu.to(self.mask_gpu_dtype)
 
-            sem_gpu = None
-            if have_sem:
-                sem_gpu = sem_cpu.to(self.device, non_blocking=True)
-                if self.semantic_gpu_dtype is not None and sem_gpu.dtype != self.semantic_gpu_dtype:
-                    sem_gpu = sem_gpu.to(self.semantic_gpu_dtype)
-
             wv_gpu = wv_cpu.to(self.device, non_blocking=True)
             pj_gpu = pj_cpu.to(self.device, non_blocking=True)
             fp_gpu = fp_cpu.to(self.device, non_blocking=True)
             cc_gpu = cc_cpu.to(self.device, non_blocking=True)
-
-            inv_gpu = None
-            dm_gpu = None
-            if have_inv:
-                inv_gpu = inv_cpu.to(self.device, non_blocking=True)
-                if dm_cpu is not None:
-                    dm_gpu = dm_cpu.to(self.device, non_blocking=True)
 
             slot.ready.record(self.prefetch_stream)
 
@@ -309,19 +177,14 @@ class GPUImageBufferPacked:
                 zfar=cam.zfar,
                 image_width=cam.image_width,
                 image_height=cam.image_height,
-                depth_reliable=getattr(cam, "depth_reliable", False),
 
                 original_image=img_gpu[i],   # view
                 alpha_mask=msk_gpu[i],       # view
-                semantic=None if sem_gpu is None else sem_gpu[i],
 
                 world_view_transform=wv_gpu[i],
                 projection_matrix=pj_gpu[i],
                 full_proj_transform=fp_gpu[i],
                 camera_center=cc_gpu[i],
-
-                invdepthmap=None if inv_gpu is None else inv_gpu[i],
-                depth_mask=None if dm_gpu is None else dm_gpu[i],
                 cpu_camera=cam,
             ))
         slot.views = views

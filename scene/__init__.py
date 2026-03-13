@@ -12,7 +12,6 @@
 import os
 import random
 import json
-from pathlib import Path
 from scene.cameras import Camera
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
@@ -38,14 +37,14 @@ class Scene:
 
     gaussians : GaussianModel
 
-    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0, 2.0, 4.0, 8.0], semantic_path=None):
+    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0, 2.0, 4.0, 8.0]):
         """b
         :param path: Path to colmap scene main folder.
         """
         self.model_path = args.model_path
+        os.makedirs(self.model_path, exist_ok=True)
         self.loaded_iter = None
         self.gaussians = gaussians
-        self.semantic_path = Path(semantic_path) if semantic_path is not None else None
 
         if load_iteration:
             if load_iteration == -1:
@@ -58,10 +57,10 @@ class Scene:
         self.test_cameras = {}
 
         if os.path.exists(os.path.join(args.source_path, "sparse")):
-            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.depths, args.eval, args.train_test_exp)
+            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval, args.train_test_exp)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
-            scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.depths, args.eval)
+            scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)
         else:
             assert False, "Could not recognize scene type!"
 
@@ -87,9 +86,9 @@ class Scene:
 
         for resolution_scale in resolution_scales:
             print("Loading Training Cameras")
-            self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale, args, scene_info.is_nerf_synthetic, False, semantic_path=self.semantic_path)
+            self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale, args, False)
             print("Loading Test Cameras")
-            self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args, scene_info.is_nerf_synthetic, True, semantic_path=self.semantic_path)
+            self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args, True)
 
         if self.loaded_iter:
             self.gaussians.load_ply(os.path.join(self.model_path,
@@ -117,7 +116,6 @@ class Scene:
         batch_size=8,
         img_gpu_dtype=torch.uint8,     # best for IO; convert later if needed
         mask_gpu_dtype=torch.uint8,
-        semantic_gpu_dtype=None,  # optional VRAM saver
         )
         return buf
 
@@ -128,6 +126,5 @@ class Scene:
         batch_size=8,
         img_gpu_dtype=torch.uint8,     # best for IO; convert later if needed
         mask_gpu_dtype=torch.uint8,
-        semantic_gpu_dtype=None,  # optional VRAM saver
         )
         return buf

@@ -71,6 +71,13 @@ def process_single_file(file_info):
     # Reshape back to image dimensions
     label_map = inverse.reshape(data_int.shape).astype(np.uint8)
 
+
+    # 5. Center crop: remove 1-pixel border => (H-2, W-2), no interpolation
+    if label_map.shape[0] > 2 and label_map.shape[1] > 2:
+        label_map = label_map[1:-1, 1:-1]
+    else:
+        return f"Image too small to crop: {input_path} with shape={label_map.shape}"
+
     # 5. Save as Indexed PNG
     pil_img = Image.fromarray(label_map, mode='P')
 

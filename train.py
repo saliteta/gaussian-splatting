@@ -11,19 +11,19 @@
 
 import os
 import torch
-import torch.nn.functional as F
+from dataclasses import dataclass
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
-from scene.cameras import Camera
-from utils.general_utils import safe_state, get_expon_lr_func
+from utils.general_utils import safe_state
 import uuid
 from tqdm import tqdm
 from pathlib import Path
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
+from typing import List
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from scene.GPUImageBuffer import GPUImageBufferPacked
 try:
@@ -45,11 +45,60 @@ except:
     SPARSE_ADAM_AVAILABLE = False
 
 
+COARSE_TO_FINE_SCALES = (8.0, 4.0, 2.0, 1.0)
 
-MASK_LOSS_MULTIPLIER = torch.tensor([1.0, 1.0, 1.0, 1.0], dtype=torch.float32, device="cuda")
-RESOLUTION_MAP = {
-    -1: 1.0, # default resolution
-}
+
+@dataclass(frozen=True)
+class TrainingStage:
+    index: int
+    scale: float
+    start_iteration: int
+    end_iteration: int
+
+    @property
+    def label(self) -> str:
+        return "1" if self.scale == 1.0 else f"/{int(self.scale)}"
+
+
+def build_training_stages(total_iterations: int, stage_iterations: int) -> List[TrainingStage]:
+    if total_iterations < 1:
+        raise ValueError("Total iterations must be at least 1.")
+    if stage_iterations < 1:
+        raise ValueError("resolution_stage_iterations must be at least 1.")
+
+    stages = []
+    for idx, scale in enumerate(COARSE_TO_FINE_SCALES):
+        start_iteration = idx * stage_iterations + 1
+        if start_iteration > total_iterations:
+            break
+
+        is_last_scale = idx == len(COARSE_TO_FINE_SCALES) - 1
+        end_iteration = total_iterations if is_last_scale else min(total_iterations, (idx + 1) * stage_iterations)
+        stages.append(TrainingStage(idx, scale, start_iteration, end_iteration))
+
+        if end_iteration >= total_iterations:
+            break
+
+    return stages
+
+
+def get_stage_for_iteration(iteration: int, stages: List[TrainingStage]) -> TrainingStage:
+    for stage in stages:
+        if stage.start_iteration <= iteration <= stage.end_iteration:
+            return stage
+    return stages[-1]
+
+
+def get_stage_local_iteration(iteration: int, stage: TrainingStage) -> int:
+    return iteration - stage.start_iteration + 1
+
+
+def describe_training_stages(stages: List[TrainingStage]):
+    print("Coarse-to-fine schedule:")
+    for stage in stages:
+        print(
+            f"  iterations {stage.start_iteration}-{stage.end_iteration}: resolution {stage.label}"
+        )
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
 
@@ -58,12 +107,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     first_iter = 0
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
-    scene = Scene(
-        dataset, 
-        gaussians, 
-        semantic_path=dataset.semantic_path, 
-        resolution_scales=list(RESOLUTION_MAP.values())
-    )
+    training_stages = build_training_stages(opt.iterations, opt.resolution_stage_iterations)
+    describe_training_stages(training_stages)
+    scene = Scene(dataset, gaussians, resolution_scales=[stage.scale for stage in training_stages])
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -76,19 +122,32 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     iter_end = torch.cuda.Event(enable_timing = True)
 
     use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE 
-    depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
+    next_iteration = first_iter + 1
+    current_stage = get_stage_for_iteration(next_iteration, training_stages)
+    if current_stage.index > 0 and next_iteration == current_stage.start_iteration:
+        gaussians.reset_densification_state()
+    print(
+        f"Starting training at resolution {current_stage.label} "
+        f"(iterations {current_stage.start_iteration}-{current_stage.end_iteration})."
+    )
 
-    camera_loader: GPUImageBufferPacked = scene.getTrainCameras(RESOLUTION_MAP[-1])
+    camera_loader: GPUImageBufferPacked = scene.getTrainCameras(current_stage.scale)
     ema_loss_for_log = 0.0
-    ema_Ll1depth_for_log = 0.0
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):
-        if iteration in RESOLUTION_MAP.keys():
+        iteration_stage = get_stage_for_iteration(iteration, training_stages)
+        if iteration_stage.index != current_stage.index:
+            current_stage = iteration_stage
             del camera_loader
             torch.cuda.empty_cache()
-            camera_loader = scene.getTrainCameras(RESOLUTION_MAP[iteration])
+            camera_loader = scene.getTrainCameras(current_stage.scale)
+            gaussians.reset_densification_state()
+            print(
+                f"\n[ITER {iteration}] Switched to resolution {current_stage.label}. "
+                f"Densification window restarted."
+            )
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
@@ -112,7 +171,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
 
-        viewpoint_cam: Camera = camera_loader.pop()
+        viewpoint_cam = camera_loader.pop()
 
         # Render
         if (iteration - 1) == debug_from:
@@ -123,58 +182,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
-        # Optional masks (alpha or semantic) used only for loss computation
-
-        mask = None
-        if viewpoint_cam.semantic is not None:
-            if isinstance(viewpoint_cam.semantic, torch.Tensor):
-                semantic_image = viewpoint_cam.semantic.detach().clone().to(device="cuda")
-            else:
-                semantic_image = torch.tensor(viewpoint_cam.semantic, device="cuda")
-            # Binary semantic mask: non-zero -> 1, zero -> 0
-            mask = MASK_LOSS_MULTIPLIER[semantic_image.long()]
-            # Resize mask to match image dimensions using nearest neighbor interpolation
-            # mask: [H, W], image: [C, H, W]
-            target_h, target_w = image.shape[1], image.shape[2]
-            if mask.shape[0] != target_h or mask.shape[1] != target_w:
-                # Reshape to [1, 1, H, W] for interpolate, then resize
-                mask = mask.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
-                mask = F.interpolate(mask, size=(target_h, target_w), mode='nearest')
-                mask = mask.squeeze(0).squeeze(0)  # [H, W]
-
-        # Loss
-        gt_image = viewpoint_cam.original_image.to(torch.float16)/255
-        if mask is not None:
-            # mask: [H, W], image: [C, H, W] -> need to add channel dimension for broadcasting
-            mask = mask.unsqueeze(0)  # [1, H, W] for broadcasting with [C, H, W]
-            image_for_loss = image * mask
-            gt_for_loss = gt_image * mask
-        else:
-            image_for_loss = image
-            gt_for_loss = gt_image
+        # Keep the loss path in float32; fused_ssim expects Float tensors.
+        image_for_loss = image.to(torch.float32)
+        gt_for_loss = viewpoint_cam.original_image.to(device=image.device, dtype=torch.float32) / 255.0
 
         Ll1 = l1_loss(image_for_loss, gt_for_loss)
-        # SSIM expects float32; image/gt_image may be float16 from buffer
         if FUSED_SSIM_AVAILABLE:
-            ssim_value = fused_ssim(image_for_loss.unsqueeze(0), image_for_loss.unsqueeze(0))
+            ssim_value = fused_ssim(image_for_loss.unsqueeze(0), gt_for_loss.unsqueeze(0))
         else:
-            ssim_value = ssim(image_for_loss, image_for_loss)
+            ssim_value = ssim(image_for_loss, gt_for_loss)
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
-
-        # Depth regularization
-        Ll1depth_pure = 0.0
-        if depth_l1_weight(iteration) > 0 and viewpoint_cam.depth_reliable:
-            invDepth = render_pkg["depth"]
-            mono_invdepth = viewpoint_cam.invdepthmap.cuda()
-            depth_mask = viewpoint_cam.depth_mask.cuda()
-
-            Ll1depth_pure = torch.abs((invDepth  - mono_invdepth) * depth_mask).mean()
-            Ll1depth = depth_l1_weight(iteration) * Ll1depth_pure 
-            loss += Ll1depth
-            Ll1depth = Ll1depth.item()
-        else:
-            Ll1depth = 0
 
         loss.backward()
 
@@ -183,10 +201,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         with torch.no_grad():
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
-            ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
 
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"})
+                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Res": current_stage.label})
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
@@ -198,16 +215,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 scene.save(iteration)
 
             # Densification
-            if iteration < opt.densify_until_iter:
+            stage_local_iteration = get_stage_local_iteration(iteration, current_stage)
+            stage_length = current_stage.end_iteration - current_stage.start_iteration + 1
+            stage_densify_until = min(opt.densify_until_iter, stage_length)
+            if stage_local_iteration <= stage_densify_until:
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                if stage_local_iteration > opt.densify_from_iter and stage_local_iteration % opt.densification_interval == 0:
+                    size_threshold = 20 if stage_local_iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
                 
-                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                if stage_local_iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and stage_local_iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 
             # Optimizer step
@@ -308,6 +328,7 @@ if __name__ == "__main__":
     args.save_iterations.append(args.iterations)
     
     print("Optimizing " + args.model_path)
+    _ = prepare_output_and_logger(args)
 
     # Initialize system state (RNG)
     safe_state(args.quiet)

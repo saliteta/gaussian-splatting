@@ -23,7 +23,6 @@ parser.add_argument("--skip_training", action="store_true")
 parser.add_argument("--skip_rendering", action="store_true")
 parser.add_argument("--skip_metrics", action="store_true")
 parser.add_argument("--output_path", default="./eval")
-parser.add_argument("--use_depth", action="store_true")
 parser.add_argument("--use_expcomp", action="store_true")
 parser.add_argument("--fast", action="store_true")
 parser.add_argument("--aa", action="store_true")
@@ -49,8 +48,6 @@ if not args.skip_training:
     
     if args.aa:
         common_args += " --antialiasing "
-    if args.use_depth:
-        common_args += " -d depths2/ "
 
     if args.use_expcomp:
         common_args += " --exposure_lr_init 0.001 --exposure_lr_final 0.0001 --exposure_lr_delay_steps 5000 --exposure_lr_delay_mult 0.001 --train_test_exp "
@@ -84,14 +81,14 @@ with open(os.path.join(args.output_path,"timing.txt"), 'w') as file:
 
 if not args.skip_rendering:
     all_sources = []
-    for scene in mipnerf360_outdoor_scenes:
-        all_sources.append(args.mipnerf360 + "/" + scene)
-    for scene in mipnerf360_indoor_scenes:
-        all_sources.append(args.mipnerf360 + "/" + scene)
+    #for scene in mipnerf360_outdoor_scenes:
+    #    all_sources.append(args.mipnerf360 + "/" + scene)
+    #for scene in mipnerf360_indoor_scenes:
+    #    all_sources.append(args.mipnerf360 + "/" + scene)
     for scene in tanks_and_temples_scenes:
         all_sources.append(args.tanksandtemples + "/" + scene)
-    for scene in deep_blending_scenes:
-        all_sources.append(args.deepblending + "/" + scene)
+    #for scene in deep_blending_scenes:
+    #    all_sources.append(args.deepblending + "/" + scene)
     
     common_args = " --quiet --eval --skip_train"
     
