@@ -26,6 +26,11 @@ from argparse import ArgumentParser, Namespace
 from typing import List
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from scene.GPUImageBuffer import GPUImageBufferPacked
+from utils.low_intensity_loss import (
+    add_low_intensity_loss_args,
+    build_low_intensity_loss_config,
+    compute_low_intensity_loss,
+)
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -137,7 +142,7 @@ def build_training_loss_images(
     gt_image = composite_with_background(gt_rgb, alpha_mask, default_background_image)
     return rendered_image.to(torch.float32), gt_image
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+def training(dataset, opt, pipe, low_intensity_cfg, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
@@ -170,6 +175,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     )
     if opt.random_background:
         print("Training loss uses per-pixel random background compositing.")
+    if low_intensity_cfg.enabled:
+        print("Training loss uses low-intensity loss only.")
 
     camera_loader: GPUImageBufferPacked = scene.getTrainCameras(current_stage.scale)
     ema_loss_for_log = 0.0
@@ -235,13 +242,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             opt.random_background,
         )
 
-        Ll1 = l1_loss(image_for_loss, gt_for_loss)
-        if FUSED_SSIM_AVAILABLE:
-            ssim_value = fused_ssim(image_for_loss.unsqueeze(0), gt_for_loss.unsqueeze(0))
+        if low_intensity_cfg.enabled:
+            Ll1 = image_for_loss.new_zeros(())
+            if FUSED_SSIM_AVAILABLE:
+                ssim_value = fused_ssim(image_for_loss.unsqueeze(0), gt_for_loss.unsqueeze(0))
+            else:
+                ssim_value = ssim(image_for_loss, gt_for_loss)
+            loss, _ = compute_low_intensity_loss(
+                image_for_loss,
+                gt_for_loss,
+                low_intensity_cfg,
+                ssim_value=ssim_value,
+            )
         else:
-            ssim_value = ssim(image_for_loss, gt_for_loss)
-
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+            Ll1 = l1_loss(image_for_loss, gt_for_loss)
+            if FUSED_SSIM_AVAILABLE:
+                ssim_value = fused_ssim(image_for_loss.unsqueeze(0), gt_for_loss.unsqueeze(0))
+            else:
+                ssim_value = ssim(image_for_loss, gt_for_loss)
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
         loss.backward()
 
@@ -369,6 +388,7 @@ if __name__ == "__main__":
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
     pp = PipelineParams(parser)
+    add_low_intensity_loss_args(parser)
     parser.add_argument('--ip', type=str, default="127.0.0.1")
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
@@ -381,6 +401,7 @@ if __name__ == "__main__":
     parser.add_argument("--start_checkpoint", type=str, default = None)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
+    low_intensity_cfg = build_low_intensity_loss_config(args)
     
     print("Optimizing " + args.model_path)
     _ = prepare_output_and_logger(args)
@@ -392,7 +413,17 @@ if __name__ == "__main__":
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    training(
+        lp.extract(args),
+        op.extract(args),
+        pp.extract(args),
+        low_intensity_cfg,
+        args.test_iterations,
+        args.save_iterations,
+        args.checkpoint_iterations,
+        args.start_checkpoint,
+        args.debug_from,
+    )
 
     # All done
     print("\nTraining complete.")
