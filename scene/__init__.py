@@ -17,9 +17,10 @@ from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
-from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
+from utils.camera_utils import cameraList_from_camInfos, cameraList_from_camInfos_preloaded, camera_to_JSON
 from scene.GPUImageBuffer import GPUImageBufferPacked
 import torch
+from concurrent.futures import ThreadPoolExecutor
 """
     The modification is like the following: 
         - We added an additional buffer loader for different resolution and cameras
@@ -84,11 +85,49 @@ class Scene:
 
         self.cameras_extent = scene_info.nerf_normalization["radius"]
 
+        # Thread pool for CPU-side image decode/resize (lazy camera decode).
+        # Keeping it here ensures all camera instances share the same executor.
+        workers = int(getattr(args, "camera_decode_workers", 8) or 0)
+        self._decode_executor = ThreadPoolExecutor(max_workers=max(1, workers))
+
+        # Preload compressed image bytes ONCE and reuse across all resolution scales.
+        # This avoids duplicating compressed data 4x when using coarse-to-fine schedules.
+        def _preload(cam_infos):
+            out = {}
+            for c in cam_infos:
+                p = str(c.image_path)
+                if p in out:
+                    continue
+                with open(p, "rb") as f:
+                    b = f.read()
+                # Get size without touching disk again.
+                with Image.open(io.BytesIO(b)) as im:
+                    out[p] = (b, im.size)  # (bytes, (W,H))
+            return out
+
+        import io
+        from PIL import Image
+
+        self._preloaded_train = _preload(scene_info.train_cameras)
+        self._preloaded_test = _preload(scene_info.test_cameras)
+
         for resolution_scale in resolution_scales:
             print("Loading Training Cameras")
-            self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale, args, False)
+            self.train_cameras[resolution_scale] = cameraList_from_camInfos_preloaded(
+                scene_info.train_cameras,
+                resolution_scale,
+                args,
+                False,
+                preloaded=self._preloaded_train,
+            )
             print("Loading Test Cameras")
-            self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args, True)
+            self.test_cameras[resolution_scale] = cameraList_from_camInfos_preloaded(
+                scene_info.test_cameras,
+                resolution_scale,
+                args,
+                True,
+                preloaded=self._preloaded_test,
+            )
 
         if self.loaded_iter:
             self.gaussians.load_ply(os.path.join(self.model_path,
@@ -116,6 +155,7 @@ class Scene:
         batch_size=8,
         img_gpu_dtype=torch.uint8,     # best for IO; convert later if needed
         mask_gpu_dtype=torch.uint8,
+        decode_executor=self._decode_executor,
         )
         return buf
 
@@ -126,5 +166,6 @@ class Scene:
         batch_size=8,
         img_gpu_dtype=torch.uint8,     # best for IO; convert later if needed
         mask_gpu_dtype=torch.uint8,
+        decode_executor=self._decode_executor,
         )
         return buf
