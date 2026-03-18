@@ -37,6 +37,7 @@ class GPUImageBufferPacked:
         # - torch.float16 saves vs float32
         img_gpu_dtype: torch.dtype = torch.uint8,
         mask_gpu_dtype: torch.dtype = torch.uint8,
+        decode_executor = None,
     ):
         self.device = torch.device(device)
         self.batch_size = batch_size
@@ -45,6 +46,7 @@ class GPUImageBufferPacked:
 
         self.img_gpu_dtype = img_gpu_dtype
         self.mask_gpu_dtype = mask_gpu_dtype
+        self.decode_executor = decode_executor
 
         self.cameras = cameras_cpu
         self.order = list(range(len(cameras_cpu)))
@@ -111,6 +113,19 @@ class GPUImageBufferPacked:
         slot.reset()
         if len(cams) == 0:
             return
+
+        # If cameras support lazy decoding, optionally pre-decode in parallel.
+        if self.decode_executor is not None:
+            futs = []
+            for c in cams:
+                if hasattr(c, "ensure_decoded"):
+                    futs.append(self.decode_executor.submit(c.ensure_decoded))
+            for f in futs:
+                f.result()
+        else:
+            for c in cams:
+                if hasattr(c, "ensure_decoded"):
+                    c.ensure_decoded()
 
         H, W = self._infer_hw(cams)
         if not self._maybe_same_hw(cams, H, W):
