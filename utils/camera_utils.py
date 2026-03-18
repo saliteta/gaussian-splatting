@@ -10,11 +10,13 @@
 #
 
 from scene.cameras import Camera
+from scene.cached_camera import CachedCamera, CachedImageBlob
 import numpy as np
 from utils.graphics_utils import fov2focal
 from PIL import Image
-from typing import List
-
+import io
+from typing import Dict, List, Tuple, Optional
+from tqdm import tqdm   
 WARNED = False
 
 
@@ -38,24 +40,31 @@ class CachedCameras:
     def set_resolution_scale(self, resolution_scale: float):
         self.current_resolution_scale = resolution_scale
 
-def loadCam(args, id, cam_info, resolution_scale, is_test_dataset) -> Camera:
+def loadCam(
+    args,
+    id,
+    cam_info,
+    resolution_scale,
+    is_test_dataset,
+    *,
+    preloaded: Optional[Dict[str, Tuple[bytes, Tuple[int, int]]]] = None,
+) -> Camera:
+    # Keep compressed bytes in RAM; decode lazily inside CachedCamera.
+    # We still open once to read header (size) if needed, but do not keep PIL objects around.
+    if preloaded is not None and str(cam_info.image_path) in preloaded:
+        image_bytes, (orig_w, orig_h) = preloaded[str(cam_info.image_path)]
+    else:
+        with open(cam_info.image_path, "rb") as f:
+            image_bytes = f.read()
+        with Image.open(io.BytesIO(image_bytes)) as im:
+            orig_w, orig_h = im.size
 
-    image = Image.open(cam_info.image_path)
-
-    orig_w, orig_h = image.size
     if args.resolution in [1, 2, 4, 8]:
         resolution = round(orig_w/(resolution_scale * args.resolution)), round(orig_h/(resolution_scale * args.resolution))
     else:  # should be a type that converts to float
         if args.resolution == -1:
-            if orig_w > 1600:
-                global WARNED
-                if not WARNED:
-                    print("[ INFO ] Encountered quite large input images (>1.6K pixels width), rescaling to 1.6K.\n "
-                        "If this is not desired, please explicitly specify '--resolution/-r' as 1")
-                    WARNED = True
-                global_down = orig_w / 1600
-            else:
-                global_down = 1
+            # Enforce original resolution (no implicit 1.6K cap).
+            global_down = 1
         else:
             global_down = orig_w / args.resolution
     
@@ -63,17 +72,62 @@ def loadCam(args, id, cam_info, resolution_scale, is_test_dataset) -> Camera:
         scale = float(global_down) * float(resolution_scale)
         resolution = (int(orig_w / scale), int(orig_h / scale))
 
-    return Camera(resolution, colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
-                  FoVx=cam_info.FovX, FoVy=cam_info.FovY, image=image,
-                  image_name=cam_info.image_name, uid=id, data_device=args.data_device,
-                  train_test_exp=args.train_test_exp, is_test_dataset=is_test_dataset, is_test_view=cam_info.is_test)
+    blob = CachedImageBlob(
+        image_path=str(cam_info.image_path),
+        image_bytes=image_bytes,
+        orig_size=(orig_w, orig_h),
+    )
+
+    # Note: Camera expects resolution as (W,H) as used throughout this repo.
+    return CachedCamera(
+        uid=id,
+        colmap_id=cam_info.uid,
+        R=cam_info.R,
+        T=cam_info.T,
+        FoVx=cam_info.FovX,
+        FoVy=cam_info.FovY,
+        image_name=cam_info.image_name,
+        blob=blob,
+        resolution=resolution,
+        data_device=args.data_device,
+        train_test_exp=args.train_test_exp,
+        is_test_dataset=is_test_dataset,
+        is_test_view=cam_info.is_test,
+    )
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args, is_test_dataset)->List[Camera]:
     camera_list = []
 
-    for id, c in enumerate(cam_infos):
+    for id, c in tqdm(enumerate(cam_infos), total=len(cam_infos), desc=f"Loading Cameras with resolution scale {resolution_scale}"):
         camera_list.append(loadCam(args, id, c, resolution_scale, is_test_dataset))
 
+    return camera_list
+
+
+def cameraList_from_camInfos_preloaded(
+    cam_infos,
+    resolution_scale,
+    args,
+    is_test_dataset,
+    *,
+    preloaded: Dict[str, Tuple[bytes, Tuple[int, int]]],
+) -> List[Camera]:
+    camera_list: List[Camera] = []
+    for id, c in tqdm(
+        enumerate(cam_infos),
+        total=len(cam_infos),
+        desc=f"Loading Cameras with resolution scale {resolution_scale}",
+    ):
+        camera_list.append(
+            loadCam(
+                args,
+                id,
+                c,
+                resolution_scale,
+                is_test_dataset,
+                preloaded=preloaded,
+            )
+        )
     return camera_list
 
 def camera_to_JSON(id, camera : Camera):
