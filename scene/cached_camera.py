@@ -125,6 +125,14 @@ class CachedCamera(torch.nn.Module):
 
         self._decoded[self._resolution] = (rgb, alpha)
 
+    def free_decoded(self) -> None:
+        """
+        Drop all decoded image tensors from the in-memory cache.
+        Call this after the image data has been copied into a pinned slab
+        (and enqueued for H2D) so the float32 CPU copies don't accumulate.
+        """
+        self._decoded.clear()
+
     @property
     def original_image(self) -> torch.Tensor:
         self.ensure_decoded()

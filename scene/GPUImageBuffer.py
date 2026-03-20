@@ -161,6 +161,10 @@ class GPUImageBufferPacked:
             fp_cpu[i].copy_(cam.full_proj_transform.cpu().to(torch.float32))
             cc_cpu[i].copy_(cam.camera_center.cpu().to(torch.float32))
 
+            # Free float32 decoded tensors — data is now in the pinned slab.
+            if hasattr(cam, "free_decoded"):
+                cam.free_decoded()
+
         # ---- One big async H2D copy per slab (prefetch stream) ----
         with torch.cuda.stream(self.prefetch_stream):
             img_gpu = img_cpu.to(self.device, non_blocking=True)
@@ -211,6 +215,102 @@ class GPUImageBufferPacked:
             slot.reset()
             return
         self._pack_and_copy(cams, slot)
+
+    # ------------------------------------------------------------------
+    # Stage-2 extension: explicit camera list, caller-supplied stream
+    # ------------------------------------------------------------------
+
+    def _pack_cameras_explicit(
+        self,
+        cams: List[Any],
+        stream: torch.cuda.Stream,
+        keepalive: list,
+    ) -> List["PackedCameraView"]:
+        """
+        Pack and H2D transfer a caller-chosen list of cameras on `stream`.
+        Returns the list of PackedCameraView objects (GPU tensors live in slabs
+        kept alive by the returned views via pinned_keepalive on a temp slot).
+
+        Used by GaussianSwapBuffer to drive KNN-based camera scheduling while
+        reusing all existing H2D packing logic unchanged.
+        """
+        tmp = _PackedSlot()
+
+        # Decode images (CPU side, same logic as _pack_and_copy)
+        if self.decode_executor is not None:
+            futs = [
+                self.decode_executor.submit(c.ensure_decoded)
+                for c in cams if hasattr(c, "ensure_decoded")
+            ]
+            for f in futs:
+                f.result()
+        else:
+            for c in cams:
+                if hasattr(c, "ensure_decoded"):
+                    c.ensure_decoded()
+
+        if not cams:
+            return []
+
+        H, W = self._infer_hw(cams)
+        B    = len(cams)
+
+        img_cpu = torch.empty((B, 3, H, W), dtype=torch.uint8, pin_memory=True)
+        msk_cpu = torch.empty((B, 1, H, W), dtype=torch.uint8, pin_memory=True)
+        wv_cpu  = torch.empty((B, 4, 4),    dtype=torch.float32, pin_memory=True)
+        pj_cpu  = torch.empty((B, 4, 4),    dtype=torch.float32, pin_memory=True)
+        fp_cpu  = torch.empty((B, 4, 4),    dtype=torch.float32, pin_memory=True)
+        cc_cpu  = torch.empty((B, 3),       dtype=torch.float32, pin_memory=True)
+
+        for i, cam in enumerate(cams):
+            img_cpu[i].copy_(self._ensure_uint8_image_cpu(cam.original_image.cpu()), non_blocking=False)
+            msk_cpu[i].copy_(self._ensure_uint8_mask_cpu(cam.alpha_mask.cpu()),      non_blocking=False)
+            wv_cpu[i].copy_(cam.world_view_transform.cpu().to(torch.float32))
+            pj_cpu[i].copy_(cam.projection_matrix.cpu().to(torch.float32))
+            fp_cpu[i].copy_(cam.full_proj_transform.cpu().to(torch.float32))
+            cc_cpu[i].copy_(cam.camera_center.cpu().to(torch.float32))
+            # Free float32 decoded tensors — data is now in the pinned slab.
+            if hasattr(cam, "free_decoded"):
+                cam.free_decoded()
+
+        with torch.cuda.stream(stream):
+            img_gpu = img_cpu.to(self.device, non_blocking=True)
+            msk_gpu = msk_cpu.to(self.device, non_blocking=True)
+            if self.img_gpu_dtype != img_gpu.dtype:
+                img_gpu = img_gpu.to(self.img_gpu_dtype)
+            if self.mask_gpu_dtype != msk_gpu.dtype:
+                msk_gpu = msk_gpu.to(self.mask_gpu_dtype)
+            wv_gpu = wv_cpu.to(self.device, non_blocking=True)
+            pj_gpu = pj_cpu.to(self.device, non_blocking=True)
+            fp_gpu = fp_cpu.to(self.device, non_blocking=True)
+            cc_gpu = cc_cpu.to(self.device, non_blocking=True)
+
+        # Keep pinned slabs alive until H2D completes (caller owns keepalive list).
+        keepalive.extend([img_cpu, msk_cpu, wv_cpu, pj_cpu, fp_cpu, cc_cpu])
+
+        views: List[PackedCameraView] = []
+        for i, cam in enumerate(cams):
+            views.append(PackedCameraView(
+                uid=cam.uid,
+                colmap_id=cam.colmap_id,
+                image_name=cam.image_name,
+                FoVx=cam.FoVx,
+                FoVy=cam.FoVy,
+                znear=cam.znear,
+                zfar=cam.zfar,
+                image_width=cam.image_width,
+                image_height=cam.image_height,
+                original_image=img_gpu[i],
+                alpha_mask=msk_gpu[i],
+                world_view_transform=wv_gpu[i],
+                projection_matrix=pj_gpu[i],
+                full_proj_transform=fp_gpu[i],
+                camera_center=cc_gpu[i],
+                cpu_camera=cam,
+            ))
+
+        # Attach keepalive to the list so caller keeps slabs alive
+        return views
 
     def pop(self) -> PackedCameraView:
         slot = self.slots[self.active]
