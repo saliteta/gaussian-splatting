@@ -16,6 +16,7 @@ import sys
 import uuid
 import torch
 import numpy as np
+from PIL import Image
 from argparse import ArgumentParser, Namespace
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import trange
@@ -38,6 +39,7 @@ try:
     FUSED_SSIM_AVAILABLE = True
 except ImportError:
     FUSED_SSIM_AVAILABLE = False
+
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -62,20 +64,87 @@ def mask_to_float01(mask: torch.Tensor, device: torch.device) -> torch.Tensor:
     return mask.to(device=device, dtype=torch.float32).clamp(0.0, 1.0)
 
 
+class FusedLoss(torch.autograd.Function):
+    """
+    Fused L1 + SSIM loss with minimal backward memory footprint.
+
+    Default autograd saves between forward and backward:
+        pred      ~100 MB  (saved by L1 and SSIM backward nodes)
+        gt_image  ~100 MB  (saved by SSIM backward node)
+        SSIM intermediates  ~900 MB  (mu1, mu2, sigma*, etc.)
+        ─────────────────────────────────────────────────────
+        Total     ~1100 MB held until loss.backward() completes
+
+    This Function saves only:
+        int8 sign(pred - gt)   25 MB   (4× smaller than float32 diff)
+        ssim_grad w.r.t. pred  100 MB  (precomputed via mini-backward in forward)
+        ─────────────────────────────────────────────────────
+        Total     ~125 MB  — ~9× reduction
+
+    The SSIM gradient is computed with a temporary sub-graph inside forward():
+    all SSIM intermediates are freed before the main loss.backward() is called.
+    gt_image is never retained in the autograd graph.
+    """
+
+    @staticmethod
+    def forward(ctx, pred, gt_image, lambda_dssim):
+        # ---- L1 ----
+        diff    = pred - gt_image                      # (3,H,W) float32 — temporary
+        l1_sign = diff.sign().to(torch.int8)           # save as int8: 4× smaller
+        l1_val  = diff.abs().mean()
+        del diff                                        # free immediately
+
+        # ---- SSIM: mini-forward + backward inside a throw-away sub-graph ----
+        # Running backward here computes d(SSIM)/d(pred) and frees all SSIM
+        # intermediates before the main loss.backward() runs.
+        pred_leaf = pred.detach().requires_grad_(True)
+        with torch.enable_grad():
+            if FUSED_SSIM_AVAILABLE:
+                sv = fused_ssim(pred_leaf.unsqueeze(0), gt_image.unsqueeze(0))
+            else:
+                sv = ssim(pred_leaf, gt_image)
+            if sv.numel() > 1:
+                sv = sv.mean()
+            sv.backward()                              # fills pred_leaf.grad
+        ssim_grad   = pred_leaf.grad                   # (3,H,W) float32 — only survivor
+        ssim_scalar = sv.item()
+        del pred_leaf, sv                              # free sub-graph + all intermediates
+
+        # Save ONLY int8 sign + ssim_grad — gt_image is NOT saved
+        ctx.save_for_backward(l1_sign, ssim_grad)
+        ctx.lambda_dssim = lambda_dssim
+        ctx.numel = float(pred.numel())
+
+        loss_val = (1.0 - lambda_dssim) * l1_val.item() + lambda_dssim * (1.0 - ssim_scalar)
+        return pred.new_tensor(loss_val), l1_val.detach()
+
+    @staticmethod
+    def backward(ctx, grad_loss, _grad_l1):
+        l1_sign, ssim_grad = ctx.saved_tensors
+        lam   = ctx.lambda_dssim
+        numel = ctx.numel
+        # d(loss)/d(pred) = (1-lam)*sign(pred-gt)/N  +  lam*(-d(SSIM)/d(pred))
+        grad_pred = grad_loss * (
+            (1.0 - lam) * l1_sign.float() / numel
+            - lam * ssim_grad
+        )
+        return grad_pred, None, None   # gt_image, lambda_dssim → no gradient
+
+
 def build_loss(rendered_image, viewpoint_cam, background, opt):
-    device = rendered_image.device
+    device   = rendered_image.device
     gt_rgb   = image_to_float01(viewpoint_cam.original_image, device)
     alpha    = mask_to_float01(viewpoint_cam.alpha_mask, device)
     bg_img   = background[:, None, None].expand_as(gt_rgb)
     gt_image = gt_rgb * alpha + bg_img * (1.0 - alpha)
-    pred     = rendered_image.to(torch.float32)
+    del gt_rgb, alpha                                  # free 133 MB before FusedLoss
 
-    Ll1 = l1_loss(pred, gt_image)
-    if FUSED_SSIM_AVAILABLE:
-        ssim_val = fused_ssim(pred.unsqueeze(0), gt_image.unsqueeze(0))
-    else:
-        ssim_val = ssim(pred, gt_image)
-    loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_val)
+    loss, Ll1 = FusedLoss.apply(
+        rendered_image.to(torch.float32),
+        gt_image,
+        opt.lambda_dssim,
+    )
+    del gt_image                                       # not retained by FusedLoss — free now
     return loss, Ll1
 
 
@@ -107,13 +176,33 @@ def save_cpu_store_ply(cpu_store: CPUGaussianStore, path: str):
     print(f"  Saved {xyz.shape[0]:,} Gaussians → {path}")
 
 
-def downsample_points(xyz_cpu: torch.Tensor, target: int) -> torch.Tensor:
-    """Random uniform downsample to `target` points (or all if fewer)."""
-    N = xyz_cpu.shape[0]
-    if N <= target:
-        return xyz_cpu
-    idx = torch.randperm(N)[:target]
-    return xyz_cpu[idx]
+def _ravel_hash(arr: np.ndarray) -> np.ndarray:
+    """Fortran-order hash for integer coordinate rows."""
+    assert arr.ndim == 2
+    arr = arr.copy()
+    arr -= arr.min(0)
+    arr = arr.astype(np.uint64, copy=False)
+    arr_max = arr.max(0).astype(np.uint64) + 1
+    keys = np.zeros(arr.shape[0], dtype=np.uint64)
+    for j in range(arr.shape[1] - 1):
+        keys += arr[:, j]
+        keys *= arr_max[j + 1]
+    keys += arr[:, -1]
+    return keys
+
+
+def voxel_downsample(xyz: np.ndarray, voxel_size: float) -> np.ndarray:
+    """
+    Voxel-grid downsample: one random point kept per occupied voxel.
+    Returns a boolean index array into xyz (or use xyz[mask]).
+    """
+    discrete = np.floor(xyz / voxel_size).astype(np.int64)
+    key      = _ravel_hash(discrete)
+    idx_sort = np.argsort(key)
+    key_sort = key[idx_sort]
+    _, _, count = np.unique(key_sort, return_inverse=True, return_counts=True)
+    idx_select  = np.cumsum(np.insert(count, 0, 0)[:-1]) + np.random.randint(0, count.max(), count.size) % count
+    return idx_sort[idx_select]
 
 
 # ---------------------------------------------------------------------------
@@ -122,9 +211,10 @@ def downsample_points(xyz_cpu: torch.Tensor, target: int) -> torch.Tensor:
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations,
              checkpoint_iterations, checkpoint,
-             ds_target: int = 1_000_000,
+             voxel_size: float = 0.08,
+             iou_sample: int = 500_000,
              batch_size: int = 8,
-             slot_budget_gb: float = 4.0,
+             slot_budget_gb: float = 2.0,
              fov_margin: float = 0.1):
 
     device = torch.device("cuda")
@@ -179,25 +269,48 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
     cpu_store.reorder(block_index.spatial_order)
 
     # -----------------------------------------------------------------------
-    # 3. Downsample point cloud for visibility precomputation
+    # 3. Downsample point cloud — two levels:
+    #    points_ds  (voxel, 16M): used for ds_blocks → accurate block coverage
+    #    points_iou (random subset of points_ds, ~500K): used for visibility
+    #               IoU / KNN only — spatial approximation is sufficient
     # -----------------------------------------------------------------------
-    print(f"[Stage2] Downsampling {cpu_store.N:,} → {ds_target:,} points for "
-          f"visibility precomputation...")
-    points_ds = downsample_points(torch.from_numpy(xyz_full), ds_target)
+    print(f"[Stage2] Voxel-downsampling {cpu_store.N:,} points "
+          f"(voxel_size={voxel_size}) for block assignment...")
+    ds_idx    = voxel_downsample(xyz_full, voxel_size)
+    points_ds = xyz_full[ds_idx]                       # (M_full, 3) numpy, for ds_blocks
+    print(f"[Stage2] Kept {len(ds_idx):,} points after voxel downsample.")
+
+    # Coarse subsample for visibility / IoU (no spatial precision needed)
+    M_full = len(points_ds)
+    if M_full > iou_sample:
+        iou_idx   = np.random.choice(M_full, size=iou_sample, replace=False)
+        points_iou = points_ds[iou_idx]
+        print(f"[Stage2] IoU subsample: {iou_sample:,} points from {M_full:,} "
+              f"(ratio {iou_sample/M_full:.2%})")
+    else:
+        points_iou = points_ds
+        print(f"[Stage2] IoU subsample: using all {M_full:,} points (below iou_sample cap).")
 
     # -----------------------------------------------------------------------
-    # 4. VisibilityPrecomputer (Step 2)
+    # 4. VisibilityPrecomputer — runs on coarse IoU points only
     # -----------------------------------------------------------------------
     cameras_all = scene.train_cameras[1.0]          # CachedCamera list at scale 1.0
     N_cams      = len(cameras_all)
 
-    print(f"[Stage2] Step 2: computing downsampled visibility for {N_cams} cameras...")
-    vp         = VisibilityPrecomputer(cameras_all, points_ds, fov_margin=fov_margin)
-    visible_ds = vp.compute()                       # (N, M) bool on CPU
+    print(f"[Stage2] Computing visibility for {N_cams} cameras "
+          f"on {len(points_iou):,} IoU points...")
+    vp         = VisibilityPrecomputer(cameras_all,
+                                       torch.from_numpy(points_iou),
+                                       fov_margin=fov_margin)
+    visible_ds = vp.compute()   # (N, ceil(M_iou/8)) uint8, bit-packed
+    M_iou      = vp.M
     vp.free()
 
-    # Assign block ids to each downsampled point
-    ds_blocks = block_index.assign_blocks(points_ds.numpy())  # (M,) int32
+    # Block assignment: use IoU points (500K) so dimensions match visible_ds.
+    # Block IDs (0..999) are the same space regardless of which point set is
+    # used — block_starts/block_ends still give accurate full-res Gaussian counts.
+    # With 500K random points across 16M, every non-trivial block gets sampled.
+    ds_blocks = block_index.assign_blocks(points_iou)   # (M_iou,) int32
 
     # -----------------------------------------------------------------------
     # 5. CameraBatchScheduler (Steps 3-7)
@@ -208,6 +321,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
     scheduler = CameraBatchScheduler(
         cameras    = cameras_all,
         visible_ds = visible_ds,
+        M          = M_iou,
         batch_size = batch_size,
     )
     batch_infos = scheduler.build(
@@ -268,26 +382,38 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
     # -----------------------------------------------------------------------
     global_step = 0
 
+    # Sorted milestone queues — fire once when global_step first crosses each value.
+    # Using sorted lists + a low-water-mark pointer so we never fire twice even if
+    # global_step jumps over the exact milestone (which can happen because we
+    # increment by 1 per camera, and slot boundaries may not align with milestones).
+    pending_saves  = sorted(set(saving_iterations))
+    pending_checks = sorted(set(checkpoint_iterations))
+    pending_evals  = sorted(set(testing_iterations))
+
+    def _fire_crossed(pending: list, step: int, action) -> None:
+        """Pop and call action(ms) for every milestone ms <= step."""
+        while pending and pending[0] <= step:
+            action(pending.pop(0))
+
     with trange(opt.iterations, desc="Stage2 training") as pbar:
         while global_step < opt.iterations:
-            # Pop: returns (camera_views, gaussian_slice) for the active slot
             camera_views, gaussians = swap_buffer.pop()
-
-            print(f"camera_views: {len(camera_views)}")
-            print(f"gaussians: {gaussians.valid_length}")
 
             # 4 rounds × B cameras per slot — amortises slot-switch overhead
             for _round in range(4):
                 if global_step >= opt.iterations:
                     break
+
+                # Update xyz LR once per round (not per camera) to reduce Python
+                # overhead inside the tight per-camera GPU loop.
+                for pg in gaussians.optimizer.param_groups:
+                    if pg['name'] == 'xyz':
+                        pg['lr'] = xyz_lr_fn(global_step)
+
+                n_this_round = 0
                 for cam in camera_views:
                     if global_step >= opt.iterations:
                         break
-
-                    # Update xyz LR on the slice's fresh SGD optimizer
-                    for pg in gaussians.optimizer.param_groups:
-                        if pg['name'] == 'xyz':
-                            pg['lr'] = xyz_lr_fn(global_step)
 
                     render_pkg = render(
                         cam, gaussians, pipe, background,
@@ -297,43 +423,39 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
                     image = render_pkg["render"]
 
                     loss, Ll1 = build_loss(image, cam, background, opt)
-                    loss.backward()
 
-                    # Free rasterizer outputs immediately — render_pkg["viewspace_points"]
-                    # has retain_grad() called inside render(), so its .grad (K×3 float32)
-                    # would otherwise persist until the next render_pkg assignment.
+                    loss.backward()
                     del render_pkg, image
 
                     with torch.no_grad():
                         gaussians.optimizer.step()
                         gaussians.optimizer.zero_grad(set_to_none=True)
 
-                    global_step += 1
-                    pbar.update(1)
-
-                    # Logging
                     if tb_writer:
                         tb_writer.add_scalar('train/l1_loss',    Ll1.item(),  global_step)
                         tb_writer.add_scalar('train/total_loss', loss.item(), global_step)
-
                     del loss, Ll1
 
-                    # Checkpoint (save current CPU state; finish_batch already flushed GPU)
-                    if global_step in checkpoint_iterations:
-                        _flush_and_save(cpu_store, dataset.model_path,
-                                        global_step, is_checkpoint=True)
+                    global_step  += 1
+                    n_this_round += 1
 
-            # Writeback active slot → CPU, prefetch next batch → freed slot, swap
+                # Batch tqdm update once per round
+                pbar.update(n_this_round)
+
+            # --- Milestone checks after the slot (not inside the per-camera loop) ---
+            # Fire saves/checkpoints/evals for any milestone we've crossed since the
+            # last slot.  Each milestone fires at most once (popped from the queue).
+            _fire_crossed(pending_checks, global_step,
+                          lambda ms: _flush_and_save(cpu_store, dataset.model_path,
+                                                     ms, is_checkpoint=True))
+            _fire_crossed(pending_saves,  global_step,
+                          lambda ms: _flush_and_save(cpu_store, dataset.model_path,
+                                                     ms, is_checkpoint=False))
+            _fire_crossed(pending_evals,  global_step,
+                          lambda ms: _eval(scene, gaussians, pipe, background,
+                                          tb_writer, ms))
+
             swap_buffer.finish_batch()
-
-            # Periodic eval
-            if global_step in testing_iterations:
-                _eval(scene, gaussians, pipe, background, tb_writer, global_step)
-
-            # Save output PLY
-            if global_step in saving_iterations:
-                _flush_and_save(cpu_store, dataset.model_path,
-                                global_step, is_checkpoint=False)
 
     # Final save
     _flush_and_save(cpu_store, dataset.model_path,
@@ -352,6 +474,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
 # Save helpers
 # ---------------------------------------------------------------------------
 
+def _save_debug_render(cam, gaussians, pipe, background, model_path, iteration):
+    """
+    Render one training-view camera with the current GPU slice and save as PNG.
+    Useful to verify Gaussian shape/opacity vs point-cloud appearance.
+    """
+    out_dir  = os.path.join(model_path, "debug_renders")
+    mkdir_p(out_dir)
+    out_path = os.path.join(out_dir, f"iter_{iteration:06d}_{cam.image_name}.png")
+
+    with torch.no_grad():
+        pkg   = render(cam, gaussians, pipe, background,
+                       use_trained_exp=False, separate_sh=False)
+        img   = pkg["render"].clamp(0, 1)           # (3, H, W) float32
+        del pkg
+
+    # Convert to uint8 PIL image and save
+    arr = (img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+    Image.fromarray(arr).save(out_path)
+    print(f"  [debug render] saved → {out_path}")
+
+
 def _flush_and_save(cpu_store, model_path, iteration, is_checkpoint):
     """Flush GPU→CPU (finish_batch already called in loop) and save PLY."""
     subdir = "checkpoint" if is_checkpoint else "point_cloud"
@@ -365,6 +508,9 @@ def _eval(scene, gaussians, pipe, background, tb_writer, iteration):
     """Quick PSNR eval on test cameras (uses the current active GPUGaussianSlice)."""
     torch.cuda.empty_cache()
     test_cams = scene.getTestCameras(scale=1.0)
+    if test_cams is None or len(getattr(test_cams, 'cameras', [])) == 0:
+        print(f"[ITER {iteration}] No test cameras available, skipping eval.")
+        return
     l1_test, psnr_test, n = 0.0, 0.0, 0
 
     with torch.no_grad():
@@ -424,8 +570,10 @@ if __name__ == "__main__":
     parser.add_argument("--quiet",            action="store_true")
 
     # Stage-2 specific
-    parser.add_argument("--ds_target",        type=int,   default=1_000_000,
-                        help="Downsampled point count for visibility precomputation")
+    parser.add_argument("--voxel_size",       type=float, default=0.08,
+                        help="Voxel size (metres) for block-assignment point cloud downsampling")
+    parser.add_argument("--iou_sample",       type=int,   default=500_000,
+                        help="Points randomly subsampled from voxel set for IoU/KNN visibility (coarse)")
     parser.add_argument("--batch_size",       type=int,   default=8,
                         help="Cameras per Gaussian batch (B)")
     parser.add_argument("--slot_budget_gb",   type=float, default=4.0,
@@ -450,7 +598,8 @@ if __name__ == "__main__":
         saving_iterations    = args.save_iterations,
         checkpoint_iterations= args.checkpoint_iterations,
         checkpoint           = args.start_checkpoint,
-        ds_target            = args.ds_target,
+        voxel_size           = args.voxel_size,
+        iou_sample           = args.iou_sample,
         batch_size           = args.batch_size,
         slot_budget_gb       = args.slot_budget_gb,
         fov_margin           = args.fov_margin,

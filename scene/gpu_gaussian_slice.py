@@ -35,9 +35,20 @@ class GPUGaussianSlice(nn.Module):
         self._rotation_buf    = torch.empty(max_gaussians, 4,    device=self.device)
         self._opacity_buf     = torch.empty(max_gaussians, 1,    device=self.device)
 
+        # Level 2 memory control: reusable screenspace buffers for render().
+        # render() normally calls torch.zeros_like(xyz) + 0 each forward pass,
+        # allocating and freeing K×3×4 bytes (~460 MB at 38 M Gaussians) 32×
+        # per batch — a prime fragmentation source.  These permanent buffers are
+        # sliced [:K] and detached each call, so no new CUDA memory is ever
+        # requested.  _sp_grad_buf is pre-wired as screenspace_points.grad to
+        # prevent PyTorch allocating a separate grad tensor during backward.
+        self._sp_buf      = torch.zeros(max_gaussians, 3, device=self.device)
+        self._sp_grad_buf = torch.zeros(max_gaussians, 3, device=self.device)
+
         self.valid_length: int              = 0
         self.cpu_indices:  np.ndarray       = np.empty(0, dtype=np.int64)
         self.optimizer:    Optional[torch.optim.Optimizer] = None
+        self._lr_dict:     Dict[str, float] = {}   # stored for lazy optimizer creation
 
         # Parameter attributes; set properly by load_from()
         self._xyz         = nn.Parameter(self._xyz_buf[:0])
@@ -127,14 +138,32 @@ class GPUGaussianSlice(nn.Module):
         self._rotation    = nn.Parameter(self._rotation_buf[:K])
         self._opacity     = nn.Parameter(self._opacity_buf[:K])
 
-        # Fresh SGD optimizer — no state carried over from previous batch
-        self.optimizer = torch.optim.SGD([
-            {'params': [self._xyz],         'lr': lr_dict.get('xyz',      1.6e-4), 'name': 'xyz'},
-            {'params': [self._features_dc], 'lr': lr_dict.get('f_dc',     2.5e-3), 'name': 'f_dc'},
-            {'params': [self._scaling],     'lr': lr_dict.get('scaling',  5.0e-3), 'name': 'scaling'},
-            {'params': [self._rotation],    'lr': lr_dict.get('rotation', 1.0e-3), 'name': 'rotation'},
-            {'params': [self._opacity],     'lr': lr_dict.get('opacity',  5.0e-2), 'name': 'opacity'},
-        ])
+        # Drop old optimizer immediately to free Adam moment tensors (~3.4 GB for 30M
+        # Gaussians). A fresh optimizer is created lazily in ensure_optimizer() only
+        # when this slot becomes the active training slot.
+        self.optimizer = None
+        self._lr_dict  = lr_dict
+
+    def ensure_optimizer(self) -> None:
+        """
+        Create the Adam optimizer if it does not already exist.
+
+        Called by GaussianSwapBuffer.pop() the moment this slot becomes active.
+        Keeping optimizer creation lazy means the prefetched (inactive) slot holds
+        only parameter data (~1.68 GB), not Adam moment tensors (~3.36 GB extra).
+        Without this, two simultaneous Adam optimizers would consume ~6.7 GB of
+        moment tensors for 30 M Gaussians.
+        """
+        if self.optimizer is not None:
+            return
+        lr = self._lr_dict
+        self.optimizer = torch.optim.Adam([
+            {'params': [self._xyz],         'lr': lr.get('xyz',      1.6e-4), 'name': 'xyz'},
+            {'params': [self._features_dc], 'lr': lr.get('f_dc',     2.5e-3), 'name': 'f_dc'},
+            {'params': [self._scaling],     'lr': lr.get('scaling',  5.0e-3), 'name': 'scaling'},
+            {'params': [self._rotation],    'lr': lr.get('rotation', 1.0e-3), 'name': 'rotation'},
+            {'params': [self._opacity],     'lr': lr.get('opacity',  5.0e-2), 'name': 'opacity'},
+        ], eps=1e-15)
 
     @torch.no_grad()
     def collect_params(self) -> Dict[str, torch.Tensor]:

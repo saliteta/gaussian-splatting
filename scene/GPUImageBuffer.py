@@ -66,6 +66,8 @@ class GPUImageBufferPacked:
     def _next_batch(self) -> List[Any]:
         out = []
         n = len(self.order)
+        if n == 0:
+            return out
         while len(out) < self.batch_size:
             if self._next >= n:
                 if not self.loop:

@@ -4,6 +4,12 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+# Lookup table: _POPCOUNT[b] = number of set bits in byte b (0..255).
+# Used to count bits in packed uint8 visibility arrays without unpacking.
+_POPCOUNT = np.zeros(256, dtype=np.int32)
+for _b in range(256):
+    _POPCOUNT[_b] = bin(_b).count('1')
+
 
 @dataclass
 class BatchInfo:
@@ -30,14 +36,15 @@ class CameraBatchScheduler:
     def __init__(
         self,
         cameras: List[Any],
-        visible_ds: np.ndarray,      # (N, M) bool — output of VisibilityPrecomputer
+        visible_ds: np.ndarray,      # (N, ceil(M/8)) uint8 — bit-packed output of VisibilityPrecomputer
+        M: int,                      # original (unpacked) number of downsampled points
         batch_size: int = 8,
         n_workers: Optional[int] = None,
     ):
-        self.cameras   = cameras
-        self.visible_ds = visible_ds  # (N, M) bool on CPU
+        self.cameras    = cameras
+        self.visible_ds = visible_ds  # (N, ceil(M/8)) uint8, bit-packed
         self.N  = len(cameras)
-        self.M  = visible_ds.shape[1]
+        self.M  = M                   # original point count (for unpacking)
         self.B  = batch_size
         self.n_workers = n_workers or max(1, os.cpu_count())
 
@@ -55,10 +62,12 @@ class CameraBatchScheduler:
         pairs = [(i, j) for i in range(N) for j in range(i + 1, N)]
 
         def _iou(pair):
+            # visible_ds rows are bit-packed uint8.  Use popcount LUT instead
+            # of unpacking — 8× fewer bytes to read, no temporary bool arrays.
             i, j = pair
             a, b  = self.visible_ds[i], self.visible_ds[j]
-            inter = np.count_nonzero(a & b)
-            union = np.count_nonzero(a | b)
+            inter = int(_POPCOUNT[a & b].sum())
+            union = int(_POPCOUNT[a | b].sum())
             return i, j, inter / union if union > 0 else 0.0
 
         print(f"  [CameraBatchScheduler] Computing {len(pairs)} pairwise IoUs "
@@ -83,11 +92,13 @@ class CameraBatchScheduler:
     # ------------------------------------------------------------------
     def build_batch_gaussians_ds(self, knn_table: np.ndarray) -> np.ndarray:
         """
-        Returns batch_gaussians_ds: (N, M) bool.
+        Returns batch_gaussians_ds: (N, ceil(M/8)) uint8, bit-packed.
         Row i = bitwise OR of visible_ds rows for all cameras in knn_table[i].
+        Bitwise OR on packed bytes is correct and needs no unpacking.
         """
-        N, M = self.N, self.M
-        batch_gaussians_ds = np.zeros((N, M), dtype=bool)
+        N = self.N
+        M_packed = self.visible_ds.shape[1]
+        batch_gaussians_ds = np.zeros((N, M_packed), dtype=np.uint8)
         for i in range(N):
             union = self.visible_ds[knn_table[i, 0]].copy()
             for cam_idx in knn_table[i, 1:]:
@@ -122,7 +133,7 @@ class CameraBatchScheduler:
                     continue
                 if cs_i & camera_sets[j]:
                     continue                             # shared camera
-                if not (bg_i & batch_gaussians_ds[j]).any():
+                if not np.any(bg_i & batch_gaussians_ds[j]):
                     clean.append(j)
 
             if clean:
@@ -173,7 +184,9 @@ class CameraBatchScheduler:
         result: Dict[int, tuple] = {}
         print(f"  [CameraBatchScheduler] Step 6: assigning voxel blocks for {N} batches...")
         for i in range(N):
-            visible_mask = self.visible_ds[knn_table[i]].any(axis=0)  # (M,) bool
+            # OR packed rows together, then unpack bits to get (M,) bool mask.
+            packed_union = np.bitwise_or.reduce(self.visible_ds[knn_table[i]])
+            visible_mask = np.unpackbits(packed_union)[:self.M].astype(bool)
             blocks = np.unique(ds_blocks[visible_mask].astype(np.int32))
             n_gauss = int(sum(
                 block_ends[b] - block_starts[b] for b in blocks

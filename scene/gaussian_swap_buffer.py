@@ -96,6 +96,11 @@ class GaussianSwapBuffer:
         self.active = 0                             # slot index currently being trained
 
         self.sample_count   = np.zeros(len(cameras), dtype=np.int64)
+        # Per-batch selection count — how many times each anchor has been loaded.
+        # Used by _pick_anchor_global and _pick_unrelated to prefer under-sampled
+        # batches, ensuring uniform coverage even when some batches have small
+        # unrelated_batches lists that would otherwise be skewed toward certain anchors.
+        self.batch_count    = np.zeros(len(batch_infos), dtype=np.int64)
         self.skipped_batches = 0
 
         # ---- Background writeback thread --------------------------------
@@ -137,6 +142,8 @@ class GaussianSwapBuffer:
         s = self.active
         # Wait for the active slot's H2D to be done on the default stream
         torch.cuda.current_stream(self.device).wait_event(self.slot_ready[s])
+        # Create Adam optimizer now (lazy: inactive slot has no optimizer → saves ~3.4 GB)
+        self.slots[s].ensure_optimizer()
         return self.cam_views[s], self.slots[s]
 
     def finish_batch(self) -> None:
@@ -219,22 +226,25 @@ class GaussianSwapBuffer:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _pick_min_count(self, candidates: list) -> int:
+        """Among candidates, return one with the minimum batch_count (random tie-break)."""
+        counts = self.batch_count[candidates]
+        min_c  = counts.min()
+        least  = [c for c, cnt in zip(candidates, counts) if cnt == min_c]
+        return random.choice(least)
+
     def _pick_anchor_global(self) -> int:
-        """Pick the camera index with the lowest sample_count (ties broken randomly)."""
-        valid = [
-            i for i in self.batch_infos
-            if i not in self._over_budget
-        ]
+        """Pick the batch anchor with the lowest batch_count (ties broken randomly)."""
+        valid = [i for i in self.batch_infos if i not in self._over_budget]
         if not valid:
             raise RuntimeError("All batches are over-budget. Cannot train.")
-        min_count = self.sample_count[valid].min()
-        candidates = [i for i in valid if self.sample_count[i] == min_count]
-        return random.choice(candidates)
+        return self._pick_min_count(valid)
 
     def _pick_unrelated(self, anchor: int) -> int:
         """
-        Pick a random batch from anchor's unrelated_batches that is not over-budget.
-        Falls back to any non-over-budget batch if all unrelated ones are over-budget.
+        Pick the least-chosen batch from anchor's unrelated_batches that is not
+        over-budget.  Falls back to any non-over-budget batch if all unrelated
+        ones are over-budget.
         """
         info = self.batch_infos[anchor]
         candidates = [
@@ -242,10 +252,10 @@ class GaussianSwapBuffer:
             if j not in self._over_budget
         ]
         if candidates:
-            return random.choice(candidates)
-        # Fallback: any non-over-budget batch
+            return self._pick_min_count(candidates)
+        # Fallback: any non-over-budget batch, least-chosen first
         fallback = [i for i in self.batch_infos if i not in self._over_budget]
-        return random.choice(fallback) if fallback else anchor
+        return self._pick_min_count(fallback) if fallback else anchor
 
     def _gather_cameras(self, anchor: int) -> List[Any]:
         """Return the list of CachedCamera objects for this batch."""
@@ -275,6 +285,7 @@ class GaussianSwapBuffer:
         stream.synchronize()    # wait for H2D before marking ready
 
         self.anchor_in_slot[s] = anchor
+        self.batch_count[anchor] += 1
 
     def _load_slot_async(self, s: int, anchor: int) -> None:
         """
@@ -306,5 +317,6 @@ class GaussianSwapBuffer:
             self.slot_ready[s].record(self.prefetch_stream)
 
         self.anchor_in_slot[s] = anchor
+        self.batch_count[anchor] += 1
         if anchor in self._over_budget:
             self.skipped_batches += 1

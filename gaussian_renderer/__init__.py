@@ -22,12 +22,27 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     Background tensor (bg_color) must be on GPU!
     """
  
-    # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
-    screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
-    try:
-        screenspace_points.retain_grad()
-    except:
-        pass
+    # Create the means2D tensor used to carry screen-space gradients back through
+    # the rasterizer.  Two paths:
+    #
+    #  Stage 2 (GPUGaussianSlice): reuse the pre-allocated _sp_buf / _sp_grad_buf.
+    #    - _sp_buf[:K].detach() shares CUDA storage with the permanent buffer —
+    #      zero new allocation.  requires_grad_(True) makes it a leaf so .grad is
+    #      stored automatically (no retain_grad() needed).
+    #    - Pre-wiring .grad = _sp_grad_buf[:K] prevents PyTorch allocating a
+    #      separate gradient tensor during backward (it accumulates in-place).
+    #
+    #  Stage 1 (GaussianModel): original path unchanged.
+    if hasattr(pc, '_sp_buf'):
+        K = pc.get_xyz.shape[0]
+        screenspace_points = pc._sp_buf[:K].detach().requires_grad_(True)
+        screenspace_points.grad = pc._sp_grad_buf[:K]
+    else:
+        screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
+        try:
+            screenspace_points.retain_grad()
+        except:
+            pass
 
     # Set up rasterization configuration
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
@@ -46,6 +61,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
         debug=pipe.debug,
+        antialiasing=False,
     )
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
@@ -98,7 +114,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             rotations = rotations,
             cov3D_precomp = cov3D_precomp)
     else:
-        rendered_image, radii = rasterizer(
+        rendered_image, radii, _ = rasterizer(
             means3D = means3D,
             means2D = means2D,
             shs = shs,

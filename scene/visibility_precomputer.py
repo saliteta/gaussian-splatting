@@ -39,12 +39,21 @@ class VisibilityPrecomputer:
 
     def compute(self) -> np.ndarray:
         """
-        Returns visible_ds: np.ndarray of shape (N, M), dtype bool.
-        Each row i is True where downsampled Gaussian j is visible from camera i.
+        Returns visible_ds: np.ndarray of shape (N, ceil(M/8)), dtype uint8.
+
+        Bit-packed: bit j of row i is set iff downsampled point j is visible
+        from camera i.  Storing bits instead of bools reduces memory 8×
+        (e.g. 506 × 16M bools = 8 GB → 506 × 2M bytes = 1 GB) and makes
+        pairwise IoU computation 8× faster via bitwise AND/OR + popcount.
+
+        To recover a bool mask for row i:
+            np.unpackbits(visible_ds[i])[:M]   # M = vp.M
         """
-        visible_ds = np.zeros((self.N, self.M), dtype=bool)
+        M_packed   = (self.M + 7) // 8
+        visible_ds = np.zeros((self.N, M_packed), dtype=np.uint8)
         for i, cam in enumerate(self.cameras):
-            visible_ds[i] = self._project_one(cam)
+            mask = self._project_one(cam)          # (M,) bool
+            visible_ds[i] = np.packbits(mask)      # (ceil(M/8),) uint8
             if (i + 1) % 100 == 0 or i == self.N - 1:
                 print(f"  [VisibilityPrecomputer] {i + 1}/{self.N} cameras done")
         return visible_ds
