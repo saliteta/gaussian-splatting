@@ -146,9 +146,21 @@ class GaussianSwapBuffer:
         self.slots[s].ensure_optimizer()
         return self.cam_views[s], self.slots[s]
 
-    def finish_batch(self) -> None:
+    def finish_batch(
+        self,
+        global_step: int = 0,
+        n_steps: int = 0,
+        current_lr_dict: Optional[Dict[str, float]] = None,
+    ) -> None:
         """
         Call after the last optimizer.step() for the active batch.
+
+        global_step:     global training step counter at the END of this batch
+                         (used for Adam bias-correction in zero-grad CPU update)
+        n_steps:         number of optimizer steps taken on this batch
+                         (used to compute compound moment decay for non-batch Gaussians)
+        current_lr_dict: {param_name → current lr} read from optimizer.param_groups
+                         (used for zero-grad Adam parameter update magnitude)
 
         Pipeline (no GPU idle between slots):
           1. Record a CUDA event marking when training on slot s is done.
@@ -157,8 +169,9 @@ class GaussianSwapBuffer:
           3. Launch a background thread that:
                a. synchronizes on the training-done event (waits for GPU)
                b. D2H slot s params → CPU scatter (writeback)
-               c. empty_cache
-               d. async H2D next batch into slot s (_load_slot_async)
+               c. apply zero-grad Adam update to non-batch Gaussians on CPU
+               d. empty_cache
+               e. async H2D next batch into slot s (_load_slot_async)
              This runs entirely while the compute stream trains on the other slot.
           4. Join the background thread from the *previous* finish_batch() call
              (two slots ago) before launching the new one, ensuring we never
@@ -195,12 +208,24 @@ class GaussianSwapBuffer:
         self.active = 1 - s
 
         # Capture references needed by the background thread.
-        _s           = s
-        _slot        = self.slots[s]
-        _cpu_idx     = self.slots[s].cpu_indices   # numpy array, immutable reference
-        _cpu_store   = self.cpu_store
-        _device_idx  = torch.cuda.current_device()  # integer index, safe across threads
+        _s              = s
+        _slot           = self.slots[s]
+        _cpu_idx        = self.slots[s].cpu_indices   # numpy array, immutable reference
+        _cpu_store      = self.cpu_store
+        _device_idx     = torch.cuda.current_device()  # integer index, safe across threads
+        _global_step    = global_step
+        _n_steps        = n_steps
+        _lr_dict        = dict(current_lr_dict) if current_lr_dict else {}
         _exc_holder: List[BaseException] = []
+
+        # Pre-compute non-batch indices on the main thread (cheap boolean mask)
+        if _n_steps > 0 and _lr_dict:
+            _mask = np.ones(self.cpu_store.N, dtype=bool)
+            _mask[_cpu_idx] = False
+            _non_batch_idx = np.where(_mask)[0].astype(np.int64)
+            del _mask
+        else:
+            _non_batch_idx = np.empty(0, dtype=np.int64)
 
         def _writeback_and_reload() -> None:
             try:
@@ -208,10 +233,22 @@ class GaussianSwapBuffer:
                 torch.cuda.set_device(_device_idx)
                 # Block until the compute stream has finished training on slot _s.
                 train_done.synchronize()
-                # D2H: copy trained params to CPU and scatter back to the store.
-                params = _slot.collect_params()
+                # D2H: copy trained params + Adam state to CPU, scatter to store.
+                params     = _slot.collect_params()
+                adam_state = _slot.collect_optimizer_state()
                 _cpu_store.scatter(_cpu_idx, params)
-                del params
+                if adam_state:
+                    _cpu_store.scatter_adam(_cpu_idx, adam_state)
+                del params, adam_state
+                # Zero-grad Adam update for non-batch Gaussians — models the momentum
+                # decay that train_fix applies implicitly when all Gaussians are on GPU.
+                if len(_non_batch_idx) > 0 and _n_steps > 0:
+                    _cpu_store.apply_zero_grad_adam(
+                        _non_batch_idx,
+                        _global_step - _n_steps,  # step counter BEFORE this batch
+                        _n_steps,
+                        _lr_dict,
+                    )
                 torch.cuda.empty_cache()
                 # Async H2D: load the next batch into the now-free slot _s.
                 self._load_slot_async(_s, next_anchor)
@@ -271,11 +308,13 @@ class GaussianSwapBuffer:
         # Free previous keepalive (if any)
         self.cam_keepalive[s] = []
 
-        # Gaussian H2D
-        indices = self.block_index.get_block_indices(info.batch_blocks)
-        params = self.cpu_store.gather(indices)
+        # Gaussian H2D — params + Adam state gathered together so the CPU
+        # gather is one pass over the store instead of two.
+        indices    = self.block_index.get_block_indices(info.batch_blocks)
+        params     = self.cpu_store.gather(indices)
+        adam_state = self.cpu_store.gather_adam(indices)
         with torch.no_grad():
-            self.slots[s].load_from(params, indices, self.lr_dict)
+            self.slots[s].load_from(params, indices, self.lr_dict, adam_state)
 
         # Camera pack + H2D
         self.cam_views[s] = self._img_buf._pack_cameras_explicit(
@@ -300,13 +339,15 @@ class GaussianSwapBuffer:
         # finish_batch() synced the compute stream before calling us).
         self.cam_keepalive[s] = []
 
-        # CPU gather — runs here (overlaps with GPU training on default stream)
-        indices = self.block_index.get_block_indices(info.batch_blocks)
-        params = self.cpu_store.gather(indices)
+        # CPU gather — overlaps with GPU training on default stream.
+        # Adam state is gathered here too (CPU-side, no GPU involvement).
+        indices    = self.block_index.get_block_indices(info.batch_blocks)
+        params     = self.cpu_store.gather(indices)
+        adam_state = self.cpu_store.gather_adam(indices)
 
         with torch.cuda.stream(self.prefetch_stream):
             # Gaussian H2D (async on prefetch_stream)
-            self.slots[s].load_from(params, indices, self.lr_dict)
+            self.slots[s].load_from(params, indices, self.lr_dict, adam_state)
 
             # Camera pack + H2D (async on prefetch_stream)
             self.cam_views[s] = self._img_buf._pack_cameras_explicit(

@@ -211,6 +211,7 @@ def voxel_downsample(xyz: np.ndarray, voxel_size: float) -> np.ndarray:
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations,
              checkpoint_iterations, checkpoint,
+             debug_render_iterations=None,
              voxel_size: float = 0.08,
              iou_sample: int = 500_000,
              batch_size: int = 8,
@@ -333,13 +334,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
     # -----------------------------------------------------------------------
     # 6. LR schedules (CPU-side, set on optimizer each step)
     # -----------------------------------------------------------------------
+    # Each Gaussian is in the active GPU batch only a fraction of all steps.
+    # The xyz LR exponential decay is keyed on global_step, so it decays
+    # 1/coverage_ratio × too fast relative to per-Gaussian real gradient steps.
+    # We correct by scaling position_lr_max_steps up by the same factor so the
+    # LR at global_step matches what the Gaussian actually deserves.
+    total_gaussian_slots = sum(info.n_gaussians for info in batch_infos.values())
+    n_valid_batches      = len([i for i in batch_infos
+                                if batch_infos[i].n_gaussians
+                                   <= int(slot_budget_gb * 1024**3) // 56])
+    avg_batch_gaussians  = total_gaussian_slots / max(1, len(batch_infos))
+    batch_coverage       = avg_batch_gaussians / max(1, cpu_store.N)
+    lr_steps_scale       = max(1.0, 1.0 / batch_coverage)
+    print(f"[Stage2] Batch coverage: {batch_coverage:.1%}  "
+          f"→ scaling position_lr_max_steps by {lr_steps_scale:.1f}×")
+
     xyz_lr_fn = get_expon_lr_func(
         lr_init       = opt.position_lr_init * spatial_lr_scale,
         lr_final      = opt.position_lr_final * spatial_lr_scale,
         lr_delay_mult = opt.position_lr_delay_mult,
-        max_steps     = opt.position_lr_max_steps,
+        max_steps     = int(opt.position_lr_max_steps * lr_steps_scale),
     )
-    # Initial LR dict for fresh SGD optimizers created in GPUGaussianSlice
+    # LR dict passed to GPUGaussianSlice; Adam state (exp_avg/exp_avg_sq/step)
+    # is persisted in CPUGaussianStore and restored on each slot swap.
     lr_dict = {
         'xyz':      opt.position_lr_init * spatial_lr_scale,
         'f_dc':     opt.feature_lr,
@@ -381,14 +398,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
     # 9. Training loop
     # -----------------------------------------------------------------------
     global_step = 0
+    slot_steps  = 0   # optimizer steps taken on the current GPU slot
 
     # Sorted milestone queues — fire once when global_step first crosses each value.
     # Using sorted lists + a low-water-mark pointer so we never fire twice even if
     # global_step jumps over the exact milestone (which can happen because we
     # increment by 1 per camera, and slot boundaries may not align with milestones).
-    pending_saves  = sorted(set(saving_iterations))
-    pending_checks = sorted(set(checkpoint_iterations))
-    pending_evals  = sorted(set(testing_iterations))
+    pending_saves         = sorted(set(saving_iterations))
+    pending_checks        = sorted(set(checkpoint_iterations))
+    pending_evals         = sorted(set(testing_iterations))
+    # 'all' → render every step (inside the per-camera loop)
+    # list  → render only at those milestones
+    if debug_render_iterations is None:
+        debug_render_iterations = []
+    pending_debug_renders = [] if debug_render_iterations == 'all' \
+                            else sorted(set(debug_render_iterations))
 
     def _fire_crossed(pending: list, step: int, action) -> None:
         """Pop and call action(ms) for every milestone ms <= step."""
@@ -436,7 +460,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
                         tb_writer.add_scalar('train/total_loss', loss.item(), global_step)
                     del loss, Ll1
 
+                    if debug_render_iterations == 'all':
+                        if cam.image_name == 'DJI_202512031141_047_DJI_20251203115218_0508_V.JPG':
+                            _save_debug_render(cam, gaussians, pipe, background,
+                                               dataset.model_path, global_step)
+
                     global_step  += 1
+                    slot_steps   += 1
                     n_this_round += 1
 
                 # Batch tqdm update once per round
@@ -454,8 +484,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
             _fire_crossed(pending_evals,  global_step,
                           lambda ms: _eval(scene, gaussians, pipe, background,
                                           tb_writer, ms))
+            _fire_crossed(pending_debug_renders, global_step,
+                          lambda ms: _save_debug_render(
+                              camera_views[0], gaussians, pipe, background,
+                              dataset.model_path, ms))
 
-            swap_buffer.finish_batch()
+            # Read current LRs from the active optimizer (xyz may have changed via schedule)
+            current_lr = {pg['name']: pg['lr'] for pg in gaussians.optimizer.param_groups}
+            swap_buffer.finish_batch(
+                global_step     = global_step,
+                n_steps         = slot_steps,
+                current_lr_dict = current_lr,
+            )
+            slot_steps = 0
 
     # Final save
     _flush_and_save(cpu_store, dataset.model_path,
@@ -580,6 +621,9 @@ if __name__ == "__main__":
                         help="GPU memory budget per Gaussian slot (GB)")
     parser.add_argument("--fov_margin",       type=float, default=0.1,
                         help="FOV expansion margin for visibility frustum")
+    parser.add_argument("--debug_render_iterations", nargs="+", type=str, default=[],
+                        help="Save a debug render PNG at these iteration milestones, "
+                             "or 'all' to render every iteration")
 
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
@@ -597,8 +641,10 @@ if __name__ == "__main__":
         testing_iterations   = args.test_iterations,
         saving_iterations    = args.save_iterations,
         checkpoint_iterations= args.checkpoint_iterations,
-        checkpoint           = args.start_checkpoint,
-        voxel_size           = args.voxel_size,
+        checkpoint              = args.start_checkpoint,
+        debug_render_iterations = 'all' if args.debug_render_iterations == ['all']
+                                          else [int(x) for x in args.debug_render_iterations],
+        voxel_size              = args.voxel_size,
         iou_sample           = args.iou_sample,
         batch_size           = args.batch_size,
         slot_budget_gb       = args.slot_budget_gb,

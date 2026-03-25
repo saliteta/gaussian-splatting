@@ -143,7 +143,7 @@ def build_training_loss_images(
     gt_image = composite_with_background(gt_rgb, alpha_mask, default_background_image)
     return rendered_image.to(torch.float32), gt_image
 
-def training(dataset, opt, pipe, low_intensity_cfg, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+def training(dataset, opt, pipe, low_intensity_cfg, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, max_gaussians: int = 0):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
@@ -153,6 +153,19 @@ def training(dataset, opt, pipe, low_intensity_cfg, testing_iterations, saving_i
     training_stages = build_training_stages(opt.iterations, opt.resolution_stage_iterations)
     describe_training_stages(training_stages)
     scene = Scene(dataset, gaussians, resolution_scales=[stage.scale for stage in training_stages])
+
+    if max_gaussians > 0 and gaussians._xyz.shape[0] > max_gaussians:
+        P = gaussians._xyz.shape[0]
+        print(f"[train_fix] Downsampling {P:,} → {max_gaussians:,} Gaussians (random).")
+        perm = torch.randperm(P, device=gaussians._xyz.device)[:max_gaussians]
+        with torch.no_grad():
+            gaussians._xyz          = torch.nn.Parameter(gaussians._xyz[perm].contiguous())
+            gaussians._features_dc  = torch.nn.Parameter(gaussians._features_dc[perm].contiguous())
+            gaussians._features_rest= torch.nn.Parameter(gaussians._features_rest[perm].contiguous())
+            gaussians._scaling      = torch.nn.Parameter(gaussians._scaling[perm].contiguous())
+            gaussians._rotation     = torch.nn.Parameter(gaussians._rotation[perm].contiguous())
+            gaussians._opacity      = torch.nn.Parameter(gaussians._opacity[perm].contiguous())
+
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -265,6 +278,10 @@ def training(dataset, opt, pipe, low_intensity_cfg, testing_iterations, saving_i
                     gaussians.optimizer.step()
                     gaussians.optimizer.zero_grad(set_to_none = True)
 
+            if (iteration in saving_iterations):
+                print("\n[ITER {}] Saving Gaussians".format(iteration))
+                scene.save(iteration)
+
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
@@ -354,6 +371,8 @@ if __name__ == "__main__":
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--max_gaussians", type=int, default=0,
+                        help="Randomly downsample to this many Gaussians before training. 0 = no limit.")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     low_intensity_cfg = build_low_intensity_loss_config(args)
@@ -378,6 +397,7 @@ if __name__ == "__main__":
         args.checkpoint_iterations,
         args.start_checkpoint,
         args.debug_from,
+        args.max_gaussians,
     )
 
     # All done

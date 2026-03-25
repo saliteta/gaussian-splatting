@@ -49,6 +49,7 @@ class GPUGaussianSlice(nn.Module):
         self.cpu_indices:  np.ndarray       = np.empty(0, dtype=np.int64)
         self.optimizer:    Optional[torch.optim.Optimizer] = None
         self._lr_dict:     Dict[str, float] = {}   # stored for lazy optimizer creation
+        self._adam_state:  Optional[Dict]   = None # CPU adam state stashed until ensure_optimizer()
 
         # Parameter attributes; set properly by load_from()
         self._xyz         = nn.Parameter(self._xyz_buf[:0])
@@ -104,14 +105,18 @@ class GPUGaussianSlice(nn.Module):
         params: Dict[str, torch.Tensor],
         indices: np.ndarray,
         lr_dict: Dict[str, float],
+        adam_state: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
     ) -> None:
         """
         In-place load of a new Gaussian batch from CPU pinned tensors.
 
-        params:   dict from CPUGaussianStore.gather() — CPU pinned tensors
-        indices:  global Gaussian indices for writeback scatter
-        lr_dict:  {param_name → initial lr} for the fresh SGD optimizer
-                  keys: 'xyz', 'f_dc', 'scaling', 'rotation', 'opacity'
+        params:     dict from CPUGaussianStore.gather() — CPU pinned tensors
+        indices:    global Gaussian indices for writeback scatter
+        lr_dict:    {param_name → lr} passed to the Adam optimizer
+                    keys: 'xyz', 'f_dc', 'scaling', 'rotation', 'opacity'
+        adam_state: optional dict from CPUGaussianStore.gather_adam().
+                    When provided, the optimizer is warm-started with the
+                    restored exp_avg / exp_avg_sq / step instead of zeros.
 
         H2D copies run on the CURRENT stream (caller is responsible for
         synchronisation via CUDA events before using the data in a forward pass).
@@ -125,11 +130,11 @@ class GPUGaussianSlice(nn.Module):
         self.cpu_indices  = indices
 
         # In-place H2D into pre-allocated buffers (non_blocking: caller syncs)
-        self._xyz_buf[:K].copy_(params['_xyz'],         non_blocking=True)
-        self._features_dc_buf[:K].copy_(params['_features_dc'], non_blocking=True)
-        self._scaling_buf[:K].copy_(params['_scaling'], non_blocking=True)
-        self._rotation_buf[:K].copy_(params['_rotation'], non_blocking=True)
-        self._opacity_buf[:K].copy_(params['_opacity'], non_blocking=True)
+        self._xyz_buf[:K].copy_(params['_xyz'],                  non_blocking=True)
+        self._features_dc_buf[:K].copy_(params['_features_dc'],  non_blocking=True)
+        self._scaling_buf[:K].copy_(params['_scaling'],          non_blocking=True)
+        self._rotation_buf[:K].copy_(params['_rotation'],        non_blocking=True)
+        self._opacity_buf[:K].copy_(params['_opacity'],          non_blocking=True)
 
         # Create parameter VIEWS of exactly [:K] rows — no new GPU allocation
         self._xyz         = nn.Parameter(self._xyz_buf[:K])
@@ -138,32 +143,61 @@ class GPUGaussianSlice(nn.Module):
         self._rotation    = nn.Parameter(self._rotation_buf[:K])
         self._opacity     = nn.Parameter(self._opacity_buf[:K])
 
-        # Drop old optimizer immediately to free Adam moment tensors (~3.4 GB for 30M
-        # Gaussians). A fresh optimizer is created lazily in ensure_optimizer() only
-        # when this slot becomes the active training slot.
-        self.optimizer = None
-        self._lr_dict  = lr_dict
+        # Drop old optimizer to free its GPU moment tensors.  A new optimizer
+        # is created lazily in ensure_optimizer() when this slot goes active.
+        # _adam_state is stashed here (CPU pinned) and injected at that point.
+        self.optimizer    = None
+        self._lr_dict     = lr_dict
+        self._adam_state  = adam_state   # None → cold start; dict → warm start
 
     def ensure_optimizer(self) -> None:
         """
-        Create the Adam optimizer if it does not already exist.
+        Create the Adam optimizer for the current parameter views.
 
         Called by GaussianSwapBuffer.pop() the moment this slot becomes active.
-        Keeping optimizer creation lazy means the prefetched (inactive) slot holds
-        only parameter data (~1.68 GB), not Adam moment tensors (~3.36 GB extra).
-        Without this, two simultaneous Adam optimizers would consume ~6.7 GB of
-        moment tensors for 30 M Gaussians.
+        Lazy creation keeps the prefetched (inactive) slot free of moment tensors
+        (~3.4 GB for 30 M Gaussians).
+
+        If _adam_state was set by load_from(), the saved exp_avg / exp_avg_sq /
+        step are injected directly into optimizer.state so training resumes with
+        warm momentum rather than cold-starting from zero.
+
+        Hyperparameters match automated3DGS: betas=(0.9, 0.999), eps=1e-15.
         """
         if self.optimizer is not None:
             return
+
         lr = self._lr_dict
         self.optimizer = torch.optim.Adam([
             {'params': [self._xyz],         'lr': lr.get('xyz',      1.6e-4), 'name': 'xyz'},
             {'params': [self._features_dc], 'lr': lr.get('f_dc',     2.5e-3), 'name': 'f_dc'},
-            {'params': [self._scaling],     'lr': lr.get('scaling',  5.0e-3), 'name': 'scaling'},
+            {'params': [self._scaling],     'lr': lr.get('scaling',  1.0e-3), 'name': 'scaling'},
             {'params': [self._rotation],    'lr': lr.get('rotation', 1.0e-3), 'name': 'rotation'},
             {'params': [self._opacity],     'lr': lr.get('opacity',  5.0e-2), 'name': 'opacity'},
-        ], eps=1e-15)
+        ], betas=(0.9, 0.999), eps=1e-15)
+
+        if self._adam_state is not None:
+            # Map param-group name → the Parameter object held by this slice.
+            name_to_param = {
+                'xyz':      self._xyz,
+                'f_dc':     self._features_dc,
+                'scaling':  self._scaling,
+                'rotation': self._rotation,
+                'opacity':  self._opacity,
+            }
+            for name, p in name_to_param.items():
+                if name not in self._adam_state:
+                    continue
+                s = self._adam_state[name]
+                # H2D for moment tensors — non_blocking is safe here because
+                # pop() already waited for slot_ready (param H2D done), and
+                # the compute stream will not touch these until optimizer.step().
+                self.optimizer.state[p] = {
+                    'step':        s['step'],   # must stay on CPU as float32 scalar
+                    'exp_avg':     s['exp_avg'].to(self.device, non_blocking=True),
+                    'exp_avg_sq':  s['exp_avg_sq'].to(self.device, non_blocking=True),
+                }
+            self._adam_state = None   # free CPU pinned memory
 
     @torch.no_grad()
     def collect_params(self) -> Dict[str, torch.Tensor]:
@@ -180,3 +214,38 @@ class GPUGaussianSlice(nn.Module):
             '_rotation':    self._rotation_buf[:K].cpu(),
             '_opacity':     self._opacity_buf[:K].cpu(),
         }
+
+    @torch.no_grad()
+    def collect_optimizer_state(self) -> Dict[str, Dict[str, torch.Tensor]]:
+        """
+        Copy current Adam optimizer state ([:valid_length]) to CPU tensors.
+
+        Returns a dict keyed by param-group name matching CPUGaussianStore.ADAM_NAMES:
+            {
+                'xyz': {'step': tensor, 'exp_avg': tensor, 'exp_avg_sq': tensor},
+                ...
+            }
+        Returns an empty dict if the optimizer has not been stepped yet
+        (state is only populated after the first optimizer.step() call).
+        """
+        if self.optimizer is None:
+            return {}
+
+        name_to_param = {
+            'xyz':      self._xyz,
+            'f_dc':     self._features_dc,
+            'scaling':  self._scaling,
+            'rotation': self._rotation,
+            'opacity':  self._opacity,
+        }
+        result = {}
+        for name, p in name_to_param.items():
+            s = self.optimizer.state.get(p)
+            if not s:
+                continue
+            result[name] = {
+                'step':        s['step'].cpu(),
+                'exp_avg':     s['exp_avg'].cpu(),
+                'exp_avg_sq':  s['exp_avg_sq'].cpu(),
+            }
+        return result
