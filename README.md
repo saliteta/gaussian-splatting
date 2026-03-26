@@ -35,14 +35,135 @@ Abstract: *Radiance Field methods have recently revolutionized novel-view synthe
 
 This research was funded by the ERC Advanced grant FUNGRAPH No 788065. The authors are grateful to Adobe for generous donations, the OPAL infrastructure from Université Côte d’Azur and for the HPC resources from GENCI–IDRIS (Grant 2022-AD011013409). The authors thank the anonymous reviewers for their valuable feedback, P. Hedman and A. Tewari for proofreading earlier drafts also T. Müller, A. Yu and S. Fridovich-Keil for helping with the comparisons.
 
-## NEW FEATURES !
+---
 
-We have limited resources for maintaining and updating the code. However, we have added a few new features since the original release that are inspired by some of the excellent work many other researchers have been doing on 3DGS. We will be adding other features within the ability of our resources.
+## Large-Scale Training Pipeline (splat_buffer branch)
 
-**Update of October 2024**: We integrated [training speed acceleration](#training-speed-acceleration) and made it compatible with [depth regularization](#depth-regularization), [anti-aliasing](#anti-aliasing) and [exposure compensation](#exposure-compensation). We have enhanced the SIBR real time viewer by correcting bugs and adding features in the [Top View](#sibr-top-view) that allows visualization of input and user cameras.
+This branch extends the original 3DGS codebase with a two-stage pipeline designed to train on massive, **dense MVS point clouds (100M+ Gaussians)** that cannot fit in GPU VRAM. The key insight is to keep all Gaussian parameters in CPU pinned memory and stream only the visible subset to the GPU for each camera batch, while overlapping data movement with training via a double-buffer design.
 
-**Update of Spring 2024**:
-Orange Labs has kindly added [OpenXR support](#openxr-support) for VR viewing. 
+The full design rationale is documented in [`DESIGN.md`](DESIGN.md).
+
+---
+
+### Stage 1 — Lazy-Decode Camera Pipeline
+
+**Problem**: loading thousands of high-resolution images into GPU memory at startup wastes RAM/VRAM. Most decoded tensors sit idle while only one is consumed per iteration.
+
+**Solution**:
+- **Compressed bytes in RAM** — each image file is read once into memory as raw JPEG/PNG bytes; no decoded pixels are stored at rest.
+- **Lazy decode on demand** — `CachedCamera` holds compressed bytes and decodes to a float tensor only when the batch loader requests it (`scene/cached_camera.py`).
+- **Parallel CPU decode** — a `ThreadPoolExecutor` pre-decodes a configurable batch in parallel before the GPU needs it.
+- **Double-buffered H2D transfer** — `GPUImageBufferPacked` maintains two GPU image slots. While the training loop consumes Slot A, Slot B is being filled via an async H2D copy on a dedicated prefetch CUDA stream. When Slot A is exhausted the buffers swap (`scene/GPUImageBuffer.py`).
+
+**Result**: disk I/O happens once at startup; CPU RAM holds only compressed bytes (10–50× smaller than decoded); the PCIe bus is saturated for the image side of training.
+
+| File | Role |
+|------|------|
+| `scene/cached_camera.py` | `CachedCamera` — compressed bytes, lazy decode, per-resolution cache |
+| `scene/GPUImageBuffer.py` | `GPUImageBufferPacked` — double-buffered packed-batch async H2D transfer |
+
+---
+
+### Stage 2 — Dynamic Gaussian Loading with KNN Batching
+
+**Problem**: a 100M-Gaussian scene requires ~4.8 GB just for parameters, plus Adam state (another ~9.6 GB), far exceeding GPU memory. For any single camera view only a small fraction of Gaussians are visible.
+
+**Architecture overview**:
+
+```
+┌─────────────────────────────────────────────────────┐
+│  ONE-TIME PRECOMPUTATION (GPU-assisted)             │
+│  1. Downsample 100M → 1M points (sampling_ply.py)  │
+│  2. Per-camera GPU frustum visibility              │
+│  3. KNN overlap graph (IoU-based, CPU-parallel)    │
+│  4. Non-overlapping batch pairing for double buf.  │
+│  5. Full-scale Gaussian index recomputation        │
+└─────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────┐
+│  RUNTIME (train_stage2.py)                         │
+│  CPUGaussianStore  ←──── all 100M params + Adam   │
+│  GaussianSwapBuffer ──── double-buffered GPU slots │
+│    Slot A: train B cameras (forward+backward+step) │
+│    Slot B: prefetch next batch async               │
+│  finish_batch(): writeback params+Adam → CPU swap  │
+└─────────────────────────────────────────────────────┘
+```
+
+#### Key components
+
+| File | Class | Purpose |
+|------|-------|---------|
+| `scene/spatial_block_index.py` | `SpatialBlockIndex` | Voxel-grid spatial blocking; prevents OOM during precomputation by processing the full point cloud in chunks |
+| `scene/visibility_precomputer.py` | `VisibilityPrecomputer` | GPU frustum culling on the 1M downsampled set; produces per-camera boolean visibility masks |
+| `scene/camera_batch_scheduler.py` | `CameraBatchScheduler` | Builds KNN overlap graph, forms batches, pairs non-overlapping batches for the double buffer, recomputes full-scale Gaussian indices |
+| `scene/cpu_gaussian_store.py` | `CPUGaussianStore` | All Gaussian params **and Adam optimizer state** in CPU pinned memory; exposes `gather` / `scatter` / `gather_adam` / `scatter_adam` |
+| `scene/gpu_gaussian_slice.py` | `GPUGaussianSlice` | Pre-allocated GPU slab; exposes the same interface as `GaussianModel`; builds a warm Adam optimizer from gathered CPU state on each swap |
+| `scene/gaussian_swap_buffer.py` | `GaussianSwapBuffer` | Double-buffer managing coupled camera + Gaussian batches; owns `sample_count` and `skipped_batches` |
+| `train_stage2.py` | — | Stage-2 training entry point; orchestrates precomputation, swap buffer, and the per-batch training loop |
+
+#### SH degree
+
+Fixed at degree 0 (constant colour per Gaussian — `features_dc` only). No densification, no SH degree upgrade, no exposure optimizer.
+
+#### Running Stage-2 training
+
+```shell
+conda run -n GauUscene python train_stage2.py \
+    -s <path to COLMAP dataset> \
+    -m <output model path> \
+    --iterations 30000
+```
+
+---
+
+### CPU-Cached Adam Optimizer (most recent addition)
+
+**Problem**: the original Stage-2 design used SGD and discarded optimizer state after each batch. This means every time a Gaussian subset is re-loaded to GPU, its Adam moments are reset to zero — equivalent to restarting training for those Gaussians.
+
+**Solution** — Adam state persisted in `CPUGaussianStore`:
+
+- `_adam_exp_avg` and `_adam_exp_avg_sq` (first and second moments) are stored in CPU pinned memory alongside the parameters, at the same layout and shape.
+- A global step counter (`_adam_step`) per param group is maintained on CPU.
+- On every slot swap, `GPUGaussianSlice` calls `gather_adam()` to fetch the stored moments for the current batch's Gaussians and **injects them directly into a new `torch.optim.Adam` instance** — the optimizer starts warm, not cold.
+- After training, `scatter_adam()` writes the updated moments back to CPU.
+
+**Zero-gradient Adam for non-batch Gaussians** (`apply_zero_grad_adam`):
+
+Gaussians not in the active GPU batch receive no gradient for the duration of that batch. However, Adam's first moment continues to decay, and the residual momentum would still drive a parameter update — exactly what the full-GPU training loop (`train_fix.py`) does. To replicate this behaviour without moving those Gaussians to GPU:
+
+```
+For n zero-gradient steps starting at Adam step t₀:
+  m_{t₀+n} = β₁ⁿ · m_{t₀}            (pure decay, no new gradient)
+  v_{t₀+n} = β₂ⁿ · v_{t₀}            (pure decay, no new gradient)
+
+Cumulative parameter delta (geometric series):
+  r = β₁ / √β₂
+  geom_coeff = r · (1 − rⁿ) / (1 − r)
+  Δθ = −lr · (m_{t₀} / (√v_{t₀} + ε)) · geom_coeff  (bias-correction omitted for clarity)
+```
+
+This CPU-side update runs **concurrently** with GPU training on the active batch via a background `ThreadPoolExecutor`, adding zero wall-clock overhead on most iterations.
+
+**Memory budget at 100M Gaussians**:
+
+| Region | Size |
+|--------|------|
+| Parameters (xyz, f_dc, scaling, rotation, opacity) | ~4.8 GB pinned |
+| Adam exp_avg (×5 param groups) | ~4.8 GB pinned |
+| Adam exp_avg_sq (×5 param groups) | ~4.8 GB pinned |
+| **Total CPU pinned** | **~14.4 GB** |
+
+GPU holds only the active slice (~5–10M Gaussians per slot × 2 slots ≈ <1 GB for params).
+
+---
+
+### Rasterizer — Absorbed as Regular Source Code
+
+The `diff-gaussian-rasterization` submodule has been absorbed into the repository as tracked source files (commit `bc9c1ea`). Local modifications (high-watermark persistent CUDA buffers, version 0.0.2) are committed directly rather than pinned to an external commit reference.
+
+---
 
 ## Step-by-step Tutorial
 
