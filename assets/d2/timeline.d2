@@ -1,0 +1,497 @@
+vars: {
+  # Lane fill colours
+  c-main:    "#1e1b4b"
+  c-bg:      "#1a0a2e"
+  c-compute: "#1c0e00"
+  c-fetch:   "#042f2e"
+  c-cpu:     "#1c0a00"
+
+  # Active cell fills
+  a-main:    "#312e81"
+  a-bg:      "#4c1d95"
+  a-compute: "#7c2d12"
+  a-fetch:   "#134e4a"
+  a-cpu:     "#78350f"
+
+  # Idle / neutral cell
+  idle:      "#1e2030"
+
+  # Stroke colours per lane
+  s-main:    "#818cf8"
+  s-bg:      "#c084fc"
+  s-compute: "#f97316"
+  s-fetch:   "#2dd4bf"
+  s-cpu:     "#fbbf24"
+
+  # Text
+  white:  "#ffffff"
+  dim:    "#64748b"
+  teal:   "#5eead4"
+  amber:  "#fcd34d"
+  orange: "#fb923c"
+  violet: "#a78bfa"
+  pink:   "#f0abfc"
+}
+
+# ── Title ──────────────────────────────────────────────────────────────────
+title: "Stage-2 Double-Buffer — Parallel Execution Timeline" {
+  shape: text
+  style.font-size: 28
+  style.bold: true
+  style.font-color: "#e2e8f0"
+}
+
+# ══════════════════════════════════════════════════════════════════════════
+# Grid: 7 rows × 9 columns
+#   Row 0  : phase header
+#   Row 1  : Main Thread
+#   Row 2  : BG Writeback Thread
+#   Row 3  : CUDA Compute Stream
+#   Row 4  : CUDA Prefetch Stream
+#   Row 5  : CPUGaussianStore
+#   Row 6  : Sync-event legend
+#
+#   Col 0  : lane label
+#   Col 1  : ① INIT
+#   Col 2  : ② Slot 0 pop
+#   Col 3  : ③ Slot 0 Train
+#   Col 4  : ④ finish_batch #1
+#   Col 5  : ⑤ PARALLEL
+#   Col 6  : ⑥ finish_batch #2
+#   Col 7  : ⑦ Slot 0 reloaded
+#   Col 8  : ⑧ … repeats
+# ══════════════════════════════════════════════════════════════════════════
+grid: {
+  label: ""
+  grid-rows: 7
+  grid-columns: 9
+  style.fill: "#0d1117"
+  style.stroke: "#30363d"
+
+  # ── ROW 0: Phase headers ─────────────────────────────────────────────
+
+  ph0: "Thread / Stream" {
+    style.fill: "#161b22"
+    style.stroke: "#30363d"
+    style.font-color: "#8b949e"
+    style.font-size: 13
+    style.bold: true
+  }
+  ph1: "① INIT\nprefetch_initial()" {
+    style.fill: "#161b22"
+    style.stroke: "#30363d"
+    style.font-color: "#e2e8f0"
+    style.font-size: 13
+    style.bold: true
+  }
+  ph2: "② Slot 0\npop()" {
+    style.fill: "#161b22"
+    style.stroke: "#30363d"
+    style.font-color: "#e2e8f0"
+    style.font-size: 13
+    style.bold: true
+  }
+  ph3: "③ Slot 0\nTraining" {
+    style.fill: "#21262d"
+    style.stroke: "#f97316"
+    style.font-color: "#fb923c"
+    style.font-size: 13
+    style.bold: true
+  }
+  ph4: "④ finish_batch #1\nSWAP 0→1" {
+    style.fill: "#161b22"
+    style.stroke: "#818cf8"
+    style.font-color: "#a5b4fc"
+    style.font-size: 13
+    style.bold: true
+  }
+  ph5: "⑤ PARALLEL\nSlot 1 Train  ‖  Slot 0 WB+Reload" {
+    style.fill: "#161b22"
+    style.stroke: "#2dd4bf"
+    style.font-color: "#5eead4"
+    style.font-size: 13
+    style.bold: true
+  }
+  ph6: "⑥ finish_batch #2\nSWAP 1→0" {
+    style.fill: "#161b22"
+    style.stroke: "#818cf8"
+    style.font-color: "#a5b4fc"
+    style.font-size: 13
+    style.bold: true
+  }
+  ph7: "⑦ Slot 0\nTraining (reloaded)" {
+    style.fill: "#21262d"
+    style.stroke: "#f97316"
+    style.font-color: "#fb923c"
+    style.font-size: 13
+    style.bold: true
+  }
+  ph8: "⑧ …\nrepeats" {
+    style.fill: "#161b22"
+    style.stroke: "#30363d"
+    style.font-color: "#8b949e"
+    style.font-size: 13
+    style.bold: true
+  }
+
+  # ── ROW 1: Main Thread ────────────────────────────────────────────────
+
+  m_lbl: "① Main\nThread" {
+    style.fill: "#1e1b4b"
+    style.stroke: "#818cf8"
+    style.font-color: "#c7d2fe"
+    style.font-size: 13
+    style.bold: true
+  }
+  m1: "prefetch_initial()\n────────────────\n_load_slot_sync(0)\n_load_slot_sync(1)\nactive = 0" {
+    style.fill: "#312e81"
+    style.stroke: "#818cf8"
+    style.font-color: "#e0e7ff"
+    style.font-size: 12
+  }
+  m2: "pop(Slot 0)\n────────────────\nwait slot_ready[0]\nensure_optimizer()" {
+    style.fill: "#312e81"
+    style.stroke: "#818cf8"
+    style.font-color: "#e0e7ff"
+    style.font-size: 12
+  }
+  m3: "Training Loop\n────────────────\n4 rounds × B cams:\n render() → image\n FusedLoss(image,gt)\n loss.backward()\n optimizer.step()\nglobal_step += B×4" {
+    style.fill: "#1e3a8a"
+    style.stroke: "#3b82f6"
+    style.font-color: "#dbeafe"
+    style.font-size: 12
+  }
+  m4: "finish_batch() #1\n────────────────\n• join prev (None)\n• train_done_0\n  .record(compute)\n• active = 1  ←SWAP\n• non_batch_idx\n• Thread.start\n  (wb_thread_A)" {
+    style.fill: "#1d4ed8"
+    style.stroke: "#60a5fa"
+    style.font-color: "#ffffff"
+    style.font-size: 12
+  }
+  m5: "pop(Slot 1)\n────────────────\nwait slot_ready[1]\nensure_optimizer()\n────────────────\nTraining Loop\n4 rounds × B cams:\n render+loss+step\nglobal_step += B×4" {
+    style.fill: "#1e3a8a"
+    style.stroke: "#3b82f6"
+    style.font-color: "#dbeafe"
+    style.font-size: 12
+  }
+  m6: "finish_batch() #2\n────────────────\n• join wb_thread_A\n  ⚠ BLOCKS if BG\n  slower than train\n• train_done_1\n  .record(compute)\n• active = 0  ←SWAP\n• Thread.start\n  (wb_thread_B)" {
+    style.fill: "#1d4ed8"
+    style.stroke: "#60a5fa"
+    style.font-color: "#ffffff"
+    style.font-size: 12
+  }
+  m7: "pop(Slot 0)\n────────────────\nwait slot_ready[0]\nensure_optimizer()\n(warm Adam resumed)\n────────────────\nTraining Loop\n4 rounds × B cams" {
+    style.fill: "#1e3a8a"
+    style.stroke: "#3b82f6"
+    style.font-color: "#dbeafe"
+    style.font-size: 12
+  }
+  m8: "…" {
+    style.fill: "#1e1b4b"
+    style.stroke: "#475569"
+    style.font-color: "#64748b"
+    style.font-size: 12
+  }
+
+  # ── ROW 2: BG Writeback Thread ────────────────────────────────────────
+
+  b_lbl: "② BG\nWriteback\nThread" {
+    style.fill: "#1a0a2e"
+    style.stroke: "#c084fc"
+    style.font-color: "#e9d5ff"
+    style.font-size: 13
+    style.bold: true
+  }
+  b1: "(not started)" {
+    style.fill: "#0d1117"
+    style.stroke: "#30363d"
+    style.stroke-dash: 5
+    style.font-color: "#30363d"
+    style.font-size: 12
+  }
+  b2: "(not started)" {
+    style.fill: "#0d1117"
+    style.stroke: "#30363d"
+    style.stroke-dash: 5
+    style.font-color: "#30363d"
+    style.font-size: 12
+  }
+  b3: "(not started)" {
+    style.fill: "#0d1117"
+    style.stroke: "#30363d"
+    style.stroke-dash: 5
+    style.font-color: "#30363d"
+    style.font-size: 12
+  }
+  b4: "← Thread.start()\n  by main thread" {
+    style.fill: "#2d1b69"
+    style.stroke: "#c084fc"
+    style.font-color: "#f3e8ff"
+    style.font-size: 12
+  }
+  b5: "a. train_done_0\n   .synchronize()\n   ← waits for GPU\nb. collect_params()\n   [D2H: xyz,fdc,\n   scale,rot,opa]\nc. collect_optimizer\n   _state() [D2H]\nd. scatter(idx0)\n   scatter_adam()\ne. apply_zero_grad\n   _adam(non_batch)\n   [β1^n,β2^n decay]\nf. empty_cache()\ng. _load_slot_async\n   (0, next_anchor)" {
+    style.fill: "#4c1d95"
+    style.stroke: "#c084fc"
+    style.font-color: "#f3e8ff"
+    style.font-size: 12
+  }
+  b6: "(thread exits)\njoined by main\nin finish_batch #2" {
+    style.fill: "#2d1b69"
+    style.stroke: "#c084fc"
+    style.font-color: "#d8b4fe"
+    style.font-size: 12
+  }
+  b7: "wb_thread_B\nrunning\n(same pattern\nfor Slot 1)" {
+    style.fill: "#4c1d95"
+    style.stroke: "#c084fc"
+    style.font-color: "#f3e8ff"
+    style.font-size: 12
+  }
+  b8: "…" {
+    style.fill: "#1a0a2e"
+    style.stroke: "#475569"
+    style.font-color: "#64748b"
+    style.font-size: 12
+  }
+
+  # ── ROW 3: CUDA Compute Stream ────────────────────────────────────────
+
+  c_lbl: "③ CUDA\nCompute\nStream\n(default)" {
+    style.fill: "#1c0e00"
+    style.stroke: "#f97316"
+    style.font-color: "#ffedd5"
+    style.font-size: 13
+    style.bold: true
+  }
+  c1: "H2D Slot 0\n[synchronous]\nH2D Slot 1\n[synchronous]\n(via _load_slot_sync\nusing current stream)" {
+    style.fill: "#431407"
+    style.stroke: "#ea580c"
+    style.font-color: "#fff7ed"
+    style.font-size: 12
+  }
+  c2: "stream.wait_event\n(slot_ready[0])\n[no-op: satisfied\nat init time]" {
+    style.fill: "#431407"
+    style.stroke: "#ea580c"
+    style.font-color: "#fff7ed"
+    style.font-size: 12
+  }
+  c3: "══ SLOT 0 ACTIVE ══\nrender() × B×4\nFusedLoss × B×4\nbackward() × B×4\noptimizer.step()\n  × B×4\n════════════════" {
+    style.fill: "#7c2d12"
+    style.stroke: "#f97316"
+    style.font-color: "#ffffff"
+    style.font-size: 12
+  }
+  c4: "train_done_0\n= Event()\ntrain_done_0\n.record(this\nstream)" {
+    style.fill: "#9a3412"
+    style.stroke: "#fb923c"
+    style.font-color: "#ffedd5"
+    style.font-size: 12
+  }
+  c5: "stream.wait_event\n(slot_ready[1])\n[satisfied at init]\n──────────────\n══ SLOT 1 ACTIVE ══\nrender() × B×4\nFusedLoss × B×4\nbackward() × B×4\noptimizer.step()\n  × B×4" {
+    style.fill: "#7c2d12"
+    style.stroke: "#f97316"
+    style.font-color: "#ffffff"
+    style.font-size: 12
+  }
+  c6: "train_done_1\n= Event()\ntrain_done_1\n.record(this\nstream)" {
+    style.fill: "#9a3412"
+    style.stroke: "#fb923c"
+    style.font-color: "#ffedd5"
+    style.font-size: 12
+  }
+  c7: "stream.wait_event\n(slot_ready[0])\n← waits for BG\n  H2D to finish\n──────────────\n══ SLOT 0 ACTIVE ══\n(reloaded batch)\nrender() × B×4\n..." {
+    style.fill: "#7c2d12"
+    style.stroke: "#f97316"
+    style.font-color: "#ffffff"
+    style.font-size: 12
+  }
+  c8: "…" {
+    style.fill: "#1c0e00"
+    style.stroke: "#475569"
+    style.font-color: "#64748b"
+    style.font-size: 12
+  }
+
+  # ── ROW 4: CUDA Prefetch Stream ───────────────────────────────────────
+
+  p_lbl: "④ CUDA\nPrefetch\nStream\n(async H2D)" {
+    style.fill: "#042f2e"
+    style.stroke: "#2dd4bf"
+    style.font-color: "#ccfbf1"
+    style.font-size: 13
+    style.bold: true
+  }
+  p1: "H2D Slot 0\n→ slot_ready[0]\n──────────────\nH2D Slot 1\n→ slot_ready[1]\n(both sync at\ninit time)" {
+    style.fill: "#134e4a"
+    style.stroke: "#14b8a6"
+    style.font-color: "#f0fdfa"
+    style.font-size: 12
+  }
+  p2: "(idle)" {
+    style.fill: "#0d1117"
+    style.stroke: "#0f766e"
+    style.stroke-dash: 5
+    style.font-color: "#0f766e"
+    style.font-size: 12
+  }
+  p3: "(idle)" {
+    style.fill: "#0d1117"
+    style.stroke: "#0f766e"
+    style.stroke-dash: 5
+    style.font-color: "#0f766e"
+    style.font-size: 12
+  }
+  p4: "(idle)" {
+    style.fill: "#0d1117"
+    style.stroke: "#0f766e"
+    style.stroke-dash: 5
+    style.font-color: "#0f766e"
+    style.font-size: 12
+  }
+  p5: "← kicked by BG\nthread step (g)\n──────────────\nH2D Slot 0\n(next batch):\n• Gaussian params\n• Adam moments\n  (exp_avg/sq)\n• cam images\n──────────────\nslot_ready[0]\n.record()" {
+    style.fill: "#134e4a"
+    style.stroke: "#2dd4bf"
+    style.font-color: "#f0fdfa"
+    style.font-size: 12
+  }
+  p6: "(idle)" {
+    style.fill: "#0d1117"
+    style.stroke: "#0f766e"
+    style.stroke-dash: 5
+    style.font-color: "#0f766e"
+    style.font-size: 12
+  }
+  p7: "(idle)" {
+    style.fill: "#0d1117"
+    style.stroke: "#0f766e"
+    style.stroke-dash: 5
+    style.font-color: "#0f766e"
+    style.font-size: 12
+  }
+  p8: "…" {
+    style.fill: "#042f2e"
+    style.stroke: "#475569"
+    style.font-color: "#64748b"
+    style.font-size: 12
+  }
+
+  # ── ROW 5: CPUGaussianStore ───────────────────────────────────────────
+
+  s_lbl: "⑤ CPU\nGaussian\nStore\n(pinned RAM)" {
+    style.fill: "#1c0a00"
+    style.stroke: "#fbbf24"
+    style.font-color: "#fef9c3"
+    style.font-size: 13
+    style.bold: true
+  }
+  s1: "gather(idx0)\ngather_adam(idx0)\n──────────────\ngather(idx1)\ngather_adam(idx1)\n→ pinned tensors\nfor both slots" {
+    style.fill: "#78350f"
+    style.stroke: "#f59e0b"
+    style.font-color: "#fef3c7"
+    style.font-size: 12
+  }
+  s2: "(params live\non GPU)" {
+    style.fill: "#0d1117"
+    style.stroke: "#92400e"
+    style.stroke-dash: 5
+    style.font-color: "#92400e"
+    style.font-size: 12
+  }
+  s3: "(params live\non GPU)" {
+    style.fill: "#0d1117"
+    style.stroke: "#92400e"
+    style.stroke-dash: 5
+    style.font-color: "#92400e"
+    style.font-size: 12
+  }
+  s4: "(params live\non GPU)" {
+    style.fill: "#0d1117"
+    style.stroke: "#92400e"
+    style.stroke-dash: 5
+    style.font-color: "#92400e"
+    style.font-size: 12
+  }
+  s5: "← called by BG\nthread steps (d,e,g)\n──────────────\nscatter(idx0)\nscatter_adam(idx0)\napply_zero_grad\n_adam(non_batch_idx)\n  [β1^n,β2^n decay\n   for n steps]\n──────────────\ngather(idx0_next)\ngather_adam\n(idx0_next)" {
+    style.fill: "#92400e"
+    style.stroke: "#fbbf24"
+    style.font-color: "#fef3c7"
+    style.font-size: 12
+  }
+  s6: "(params live\non GPU)" {
+    style.fill: "#0d1117"
+    style.stroke: "#92400e"
+    style.stroke-dash: 5
+    style.font-color: "#92400e"
+    style.font-size: 12
+  }
+  s7: "(Slot 0 reloaded\nparams live\non GPU)" {
+    style.fill: "#0d1117"
+    style.stroke: "#92400e"
+    style.stroke-dash: 5
+    style.font-color: "#92400e"
+    style.font-size: 12
+  }
+  s8: "…" {
+    style.fill: "#1c0a00"
+    style.stroke: "#475569"
+    style.font-color: "#64748b"
+    style.font-size: 12
+  }
+
+  # ── ROW 6: Sync-event annotations ────────────────────────────────────
+
+  ev_lbl: "CUDA\nEvents &\nSync Points" {
+    style.fill: "#0d1117"
+    style.stroke: "#30363d"
+    style.font-color: "#8b949e"
+    style.font-size: 12
+    style.bold: true
+  }
+  ev1: "" {
+    style.fill: "#0d1117"
+    style.stroke: "#30363d"
+    style.font-size: 12
+    style.font-color: "#30363d"
+  }
+  ev2: "" {
+    style.fill: "#0d1117"
+    style.stroke: "#30363d"
+    style.font-size: 12
+    style.font-color: "#30363d"
+  }
+  ev3: "compute_stream\nfrees render\nbuffers after step\n\nSlot 1 GPU buffers\nstay idle\n(no optimizer yet\n→ saves ~3.4 GB)" {
+    style.fill: "#0d1117"
+    style.stroke: "#30363d"
+    style.font-color: "#64748b"
+    style.font-size: 11
+  }
+  ev4: "★ train_done_0\nrecorded on\ncompute stream\n→ BG thread will\n  synchronize on it" {
+    style.fill: "#1c1917"
+    style.stroke: "#fb923c"
+    style.font-color: "#fdba74"
+    style.font-size: 11
+  }
+  ev5: "★ KEY OVERLAP:\nCompute trains Slot1\n  while BG thread:\n  syncs on train_done_0\n  does D2H Slot0\n  scatters to CPU\n  reloads Slot0 async\n\nNo GPU idle time\nbetween slots!" {
+    style.fill: "#0f2027"
+    style.stroke: "#2dd4bf"
+    style.font-color: "#5eead4"
+    style.font-size: 11
+  }
+  ev6: "★ train_done_1\nrecorded\n\n⚠ join may block\nmain thread if\nBG thread slower\nthan training" {
+    style.fill: "#1c1917"
+    style.stroke: "#fb923c"
+    style.font-color: "#fdba74"
+    style.font-size: 11
+  }
+  ev7: "★ slot_ready[0]\nwaited by compute\nstream before\nstarting Slot0\ntraining\n(stream-level dep,\nnot CPU stall)" {
+    style.fill: "#0f2027"
+    style.stroke: "#2dd4bf"
+    style.font-color: "#5eead4"
+    style.font-size: 11
+  }
+  ev8: "" {
+    style.fill: "#0d1117"
+    style.stroke: "#30363d"
+    style.font-size: 12
+    style.font-color: "#30363d"
+  }
+}

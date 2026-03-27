@@ -1,0 +1,95 @@
+direction: right
+
+# ── Invisible wrapper keeps Disk and GPU stacked on the left ──
+storage: {
+  label: ""
+  style.stroke: transparent
+  style.fill:   transparent
+
+  Disk: {
+    label: "💾 Disk"
+    direction: down
+    style.stroke: "#94a3b8"
+    style.fill:   "#1e293b"
+    style.font-color: "#ffffff"
+
+    IMG: "High-Res Images\n(JPEG / PNG)" {
+      shape: rectangle
+      style.fill:       "#475569"
+      style.stroke:     "#94a3b8"
+      style.font-color: "#ffffff"
+    }
+  }
+
+  GPU: {
+    label: "🎮 GPU VRAM — Device Memory"
+    direction: down
+    style.stroke: "#6ee7b7"
+    style.fill:   "#022c22"
+    style.font-color: "#ffffff"
+
+    SB: "Slot B\n(Prefetching)" {
+      style.fill:       "#059669"
+      style.stroke:     "#6ee7b7"
+      style.font-color: "#ffffff"
+    }
+    SA: "Slot A\n(Active)" {
+      style.fill:       "#059669"
+      style.stroke:     "#6ee7b7"
+      style.font-color: "#ffffff"
+    }
+    TL: "Training Loop\n(Renders & Back-props)" {
+      shape: oval
+      style.fill:       "#2563eb"
+      style.stroke:     "#93c5fd"
+      style.font-color: "#ffffff"
+    }
+
+    SB -> SA: "swap when A exhausted" {
+      style.stroke-dash: 4
+      style.stroke: "#6ee7b7"
+    }
+    SA -> TL: "feeds pixel data" {
+      style.stroke: "#6ee7b7"
+    }
+  }
+}
+
+# ── CPU on the right ──
+CPU: {
+  label: "🧠 CPU RAM — Host Memory"
+  direction: down
+  style.stroke: "#fcd34d"
+  style.fill:   "#1c0a00"
+  style.font-color: "#ffffff"
+
+  CB: "CachedCamera\n(Compressed Bytes)" {
+    style.fill:       "#d97706"
+    style.stroke:     "#fcd34d"
+    style.font-color: "#ffffff"
+  }
+  TP: "ThreadPoolExecutor\n(Parallel CPU Decode)" {
+    shape: oval
+    style.fill:       "#2563eb"
+    style.stroke:     "#93c5fd"
+    style.font-color: "#ffffff"
+  }
+  FT: "Decoded Float Tensors\n(Pre-fetched Batch)" {
+    style.fill:       "#d97706"
+    style.stroke:     "#fcd34d"
+    style.font-color: "#ffffff"
+  }
+
+  CB -> TP: "lazy decode on demand" {style.stroke: "#fcd34d"}
+  TP -> FT: "decoded batch ready"   {style.stroke: "#fcd34d"}
+}
+
+# ── Cross-container edges ──
+storage.Disk.IMG -> CPU.CB: "read once at startup" {
+  style.stroke:     "#94a3b8"
+  style.font-color: "#94a3b8"
+}
+CPU.FT -> storage.GPU.SB: "async H2D copy\n(CUDA prefetch stream)" {
+  style.stroke:     "#fcd34d"
+  style.font-color: "#fcd34d"
+}

@@ -1,0 +1,172 @@
+direction: down
+
+title: "Camera Scheduling & Spatial Indexing" {
+  shape: text
+  style.font-size: 24
+  style.bold: true
+  style.font-color: "#e2e8f0"
+}
+
+sbi: "SpatialBlockIndex\n(Spatial Grid)" {
+  style.fill: "#1e1b4b"
+  style.stroke: "#818cf8"
+  style.font-color: "#ffffff"
+  style.font-size: 17
+  direction: right
+
+  voxel: "Voxel Grid\n(resolution=10m)" {
+    style.fill: "#312e81"
+    style.stroke: "#818cf8"
+    style.font-color: "#e0e7ff"
+    style.font-size: 14
+  }
+  spatial_order: "spatial_order[]\n(Morton / row sort)" {
+    style.fill: "#312e81"
+    style.stroke: "#818cf8"
+    style.font-color: "#e0e7ff"
+    style.font-size: 14
+  }
+  block_ranges: "block_starts[]\nblock_ends[]\n(contiguous row ranges)" {
+    style.fill: "#312e81"
+    style.stroke: "#818cf8"
+    style.font-color: "#e0e7ff"
+    style.font-size: 14
+  }
+  get_block: "get_block_indices(blocks)\n→ concat Gaussian indices" {
+    shape: oval
+    style.fill: "#312e81"
+    style.stroke: "#818cf8"
+    style.font-color: "#e0e7ff"
+    style.font-size: 14
+  }
+
+  voxel -> spatial_order: "reorder CPUGaussianStore" { style.stroke: "#818cf8" }
+  spatial_order -> block_ranges: "" { style.stroke: "#818cf8" }
+  block_ranges -> get_block: "" { style.stroke: "#818cf8" }
+}
+
+vis: "VisibilityPrecomputer" {
+  style.fill: "#0c1a2e"
+  style.stroke: "#3b82f6"
+  style.font-color: "#ffffff"
+  style.font-size: 17
+  direction: right
+
+  pts: "IoU Point Set\n(~500K voxel-sampled\nGaussian positions)" {
+    style.fill: "#1e3a5f"
+    style.stroke: "#60a5fa"
+    style.font-color: "#e0f2fe"
+    style.font-size: 14
+  }
+  frustum: "Frustum Check\n(fov_margin expansion\nper camera)" {
+    shape: oval
+    style.fill: "#1e3a5f"
+    style.stroke: "#60a5fa"
+    style.font-color: "#e0f2fe"
+    style.font-size: 14
+  }
+  bitmask: "visible_ds\n(N_cams × ceil(M/8) uint8\nbit-packed)" {
+    style.fill: "#1e3a5f"
+    style.stroke: "#60a5fa"
+    style.font-color: "#e0f2fe"
+    style.font-size: 14
+  }
+
+  pts -> frustum: "project → check bounds" { style.stroke: "#60a5fa" }
+  frustum -> bitmask: "set bit if visible" { style.stroke: "#60a5fa" }
+}
+
+sched: "CameraBatchScheduler" {
+  style.fill: "#0f1f0f"
+  style.stroke: "#4ade80"
+  style.font-color: "#ffffff"
+  style.font-size: 17
+  direction: right
+
+  iou: "IoU Overlap\n(cam pair × shared blocks)" {
+    shape: oval
+    style.fill: "#14532d"
+    style.stroke: "#4ade80"
+    style.font-color: "#dcfce7"
+    style.font-size: 14
+  }
+  knn: "KNN Grouping\n(top-B cameras per anchor)" {
+    shape: oval
+    style.fill: "#14532d"
+    style.stroke: "#4ade80"
+    style.font-color: "#dcfce7"
+    style.font-size: 14
+  }
+  batch_infos: "batch_infos dict\nanchor_id →\n  BatchInfo {\n    batch_camera_ids [B]\n    batch_blocks  [block IDs]\n    n_gaussians\n    unrelated_batches\n  }" {
+    style.fill: "#14532d"
+    style.stroke: "#4ade80"
+    style.font-color: "#dcfce7"
+    style.font-size: 13
+  }
+  budget: "Slot Budget Check\n(n_gaussians ≤\nslot_budget_bytes / 56)" {
+    shape: diamond
+    style.fill: "#14532d"
+    style.stroke: "#4ade80"
+    style.font-color: "#dcfce7"
+    style.font-size: 14
+  }
+
+  iou -> knn: "" { style.stroke: "#4ade80" }
+  knn -> batch_infos: "" { style.stroke: "#4ade80" }
+  batch_infos -> budget: "" { style.stroke: "#4ade80" }
+}
+
+anchor_pick: "Anchor Selection\n(inside GaussianSwapBuffer)" {
+  style.fill: "#1a1a2e"
+  style.stroke: "#a78bfa"
+  style.font-color: "#e9d5ff"
+  style.font-size: 17
+  direction: right
+
+  global_pick: "_pick_anchor_global()\nmin batch_count\n(least-trained batch first)" {
+    shape: oval
+    style.fill: "#2d1b69"
+    style.stroke: "#a78bfa"
+    style.font-color: "#e9d5ff"
+    style.font-size: 14
+  }
+  unrelated: "_pick_unrelated(anchor)\nchoose from\nunrelated_batches\n(spatially disjoint)" {
+    shape: oval
+    style.fill: "#2d1b69"
+    style.stroke: "#a78bfa"
+    style.font-color: "#e9d5ff"
+    style.font-size: 14
+  }
+  sample_count: "sample_count[]\nbatch_count[]\n(coverage tracking)" {
+    style.fill: "#2d1b69"
+    style.stroke: "#a78bfa"
+    style.font-color: "#e9d5ff"
+    style.font-size: 14
+  }
+
+  global_pick -> unrelated: "for the inactive slot" { style.stroke: "#a78bfa" }
+  unrelated -> sample_count: "increment on finish_batch" { style.stroke: "#a78bfa" }
+}
+
+# ── Flow ─────────────────────────────────────────────────────────────────
+
+sbi -> vis: "assign_blocks(points_iou)\n→ ds_blocks per point" {
+  style.stroke: "#818cf8"
+  style.font-color: "#818cf8"
+  style.font-size: 13
+}
+vis -> sched: "visible_ds bitmask\n+ ds_blocks" {
+  style.stroke: "#3b82f6"
+  style.font-color: "#3b82f6"
+  style.font-size: 13
+}
+sched.batch_infos -> anchor_pick: "batch_infos lookup\nat runtime" {
+  style.stroke: "#4ade80"
+  style.font-color: "#4ade80"
+  style.font-size: 13
+}
+anchor_pick.global_pick -> sbi.get_block: "batch_infos[anchor].batch_blocks\n→ get_block_indices()" {
+  style.stroke: "#a78bfa"
+  style.font-color: "#a78bfa"
+  style.font-size: 13
+}

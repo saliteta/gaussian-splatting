@@ -1,0 +1,143 @@
+direction: right
+
+title: "Gaussian Memory Layout — CPUGaussianStore ↔ GPUGaussianSlice" {
+  shape: text
+  style.font-size: 24
+  style.bold: true
+  style.font-color: "#e2e8f0"
+}
+
+cpu: "CPU Pinned Memory — CPUGaussianStore" {
+  style.fill: "#1c0a00"
+  style.stroke: "#fcd34d"
+  style.font-color: "#ffffff"
+  style.font-size: 18
+  direction: down
+
+  params: "Parameter Tensors\n(all N Gaussians, float32)" {
+    style.fill: "#78350f"
+    style.stroke: "#fcd34d"
+    style.font-color: "#ffffff"
+    style.font-size: 15
+
+    xyz: "_xyz      (N, 3)" { style.fill: "#92400e"; style.stroke: "#fcd34d"; style.font-color: "#fff"; style.font-size: 14 }
+    fdc: "_features_dc  (N, 1, 3)" { style.fill: "#92400e"; style.stroke: "#fcd34d"; style.font-color: "#fff"; style.font-size: 14 }
+    sc:  "_scaling  (N, 3)" { style.fill: "#92400e"; style.stroke: "#fcd34d"; style.font-color: "#fff"; style.font-size: 14 }
+    rot: "_rotation (N, 4)" { style.fill: "#92400e"; style.stroke: "#fcd34d"; style.font-color: "#fff"; style.font-size: 14 }
+    opa: "_opacity  (N, 1)" { style.fill: "#92400e"; style.stroke: "#fcd34d"; style.font-color: "#fff"; style.font-size: 14 }
+  }
+
+  adam: "Adam State Tensors\n(one entry per Gaussian per param)" {
+    style.fill: "#78350f"
+    style.stroke: "#fcd34d"
+    style.font-color: "#ffffff"
+    style.font-size: 15
+
+    ea: "_adam_exp_avg\n  {xyz,f_dc,scaling,rotation,opacity}" { style.fill: "#92400e"; style.stroke: "#fcd34d"; style.font-color: "#fff"; style.font-size: 13 }
+    ea2: "_adam_exp_avg_sq\n  same shapes" { style.fill: "#92400e"; style.stroke: "#fcd34d"; style.font-color: "#fff"; style.font-size: 13 }
+    step: "_adam_step\n  {name → scalar float32}" { style.fill: "#92400e"; style.stroke: "#fcd34d"; style.font-color: "#fff"; style.font-size: 13 }
+  }
+
+  ops: "Operations" {
+    style.fill: "#1c0a00"
+    style.stroke: "#fcd34d"
+    style.stroke-dash: 4
+    style.font-color: "#fcd34d"
+    style.font-size: 14
+
+    gather: "gather(indices)\n→ slice K rows\ninto pinned tensors" { style.fill: "#78350f"; style.stroke: "#fcd34d"; style.font-color: "#fff"; style.font-size: 13 }
+    scatter: "scatter(indices, params)\n→ write K rows back" { style.fill: "#78350f"; style.stroke: "#fcd34d"; style.font-color: "#fff"; style.font-size: 13 }
+    zero_adam: "apply_zero_grad_adam()\n→ decay non-batch\nβ1^n, β2^n for n steps" { style.fill: "#78350f"; style.stroke: "#fcd34d"; style.font-color: "#fff"; style.font-size: 13 }
+    reorder: "reorder(perm)\n→ spatially sort\nonce at startup" { style.fill: "#78350f"; style.stroke: "#fcd34d"; style.font-color: "#fff"; style.font-size: 13 }
+  }
+}
+
+gpu_a: "GPU VRAM — Slot A (Active)\nGPUGaussianSlice (max_gaussians budget)" {
+  style.fill: "#022c22"
+  style.stroke: "#6ee7b7"
+  style.font-color: "#ffffff"
+  style.font-size: 17
+  direction: down
+
+  buf_a: "Pre-allocated Buffers\n(fixed, never reallocated)" {
+    style.fill: "#065f46"
+    style.stroke: "#6ee7b7"
+    style.font-color: "#ffffff"
+    style.font-size: 15
+
+    xyz_a:  "_xyz_buf         (max, 3)" { style.fill: "#047857"; style.stroke: "#6ee7b7"; style.font-color: "#fff"; style.font-size: 13 }
+    fdc_a:  "_features_dc_buf (max, 1, 3)" { style.fill: "#047857"; style.stroke: "#6ee7b7"; style.font-color: "#fff"; style.font-size: 13 }
+    sc_a:   "_scaling_buf     (max, 3)" { style.fill: "#047857"; style.stroke: "#6ee7b7"; style.font-color: "#fff"; style.font-size: 13 }
+    rot_a:  "_rotation_buf    (max, 4)" { style.fill: "#047857"; style.stroke: "#6ee7b7"; style.font-color: "#fff"; style.font-size: 13 }
+    opa_a:  "_opacity_buf     (max, 1)" { style.fill: "#047857"; style.stroke: "#6ee7b7"; style.font-color: "#fff"; style.font-size: 13 }
+  }
+
+  views_a: "nn.Parameter VIEWS\n[:K] of each buffer\n(zero-copy slices)" {
+    style.fill: "#065f46"
+    style.stroke: "#34d399"
+    style.font-color: "#ffffff"
+    style.font-size: 15
+  }
+
+  opt_a: "Adam Optimizer\n(warm-started from\nCPU exp_avg/exp_avg_sq)\n~3.4 GB moment tensors" {
+    shape: oval
+    style.fill: "#1a1a2e"
+    style.stroke: "#a78bfa"
+    style.font-color: "#e9d5ff"
+    style.font-size: 14
+  }
+
+  buf_a -> views_a: "load_from(): buf[:K].copy_(params)" { style.stroke: "#34d399" }
+  views_a -> opt_a: "ensure_optimizer()\n(lazy — only when active)" { style.stroke: "#a78bfa" }
+}
+
+gpu_b: "GPU VRAM — Slot B (Prefetch)\nGPUGaussianSlice" {
+  style.fill: "#022c22"
+  style.stroke: "#34d399"
+  style.stroke-dash: 5
+  style.font-color: "#d1fae5"
+  style.font-size: 17
+  direction: down
+
+  buf_b: "Pre-allocated Buffers\n(same structure as Slot A)" {
+    style.fill: "#064e3b"
+    style.stroke: "#34d399"
+    style.font-color: "#d1fae5"
+    style.font-size: 15
+  }
+
+  no_opt: "NO optimizer yet\n(created only when\nthis slot becomes active)\n→ saves ~3.4 GB" {
+    shape: oval
+    style.fill: "#1a1a2e"
+    style.stroke: "#475569"
+    style.font-color: "#94a3b8"
+    style.font-size: 14
+  }
+
+  buf_b -> no_opt: "" { style.stroke: "#475569"; style.stroke-dash: 4 }
+}
+
+# ── Cross edges ───────────────────────────────────────────────────────────
+
+cpu.ops.gather -> gpu_a.buf_a: "H2D via load_from()\nnon_blocking=True\n(prefetch_stream)" {
+  style.stroke: "#fcd34d"
+  style.font-color: "#fcd34d"
+  style.font-size: 13
+}
+gpu_a.buf_a -> cpu.ops.scatter: "D2H via collect_params()\n+ collect_optimizer_state()\n(after train_done.sync)" {
+  style.stroke: "#f472b6"
+  style.font-color: "#f472b6"
+  style.font-size: 13
+}
+cpu.ops.gather -> gpu_b.buf_b: "async prefetch\n(next batch)" {
+  style.stroke: "#34d399"
+  style.font-color: "#34d399"
+  style.font-size: 13
+  style.stroke-dash: 4
+}
+gpu_b -> gpu_a: "swap:\nactive = 1-s\n(finish_batch)" {
+  style.stroke: "#6ee7b7"
+  style.font-color: "#6ee7b7"
+  style.font-size: 13
+  style.stroke-dash: 4
+}

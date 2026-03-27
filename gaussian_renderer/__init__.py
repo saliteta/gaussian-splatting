@@ -1,143 +1,104 @@
-#
-# Copyright (C) 2023, Inria
-# GRAPHDECO research group, https://team.inria.fr/graphdeco
-# All rights reserved.
-#
-# This software is free for non-commercial, research and evaluation use 
-# under the terms of the LICENSE.md file.
-#
-# For inquiries contact  george.drettakis@inria.fr
-#
-
-import torch
 import math
-from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
-from scene.gaussian_model import GaussianModel
-from utils.sh_utils import eval_sh
+import torch
+from gsplat import rasterization
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False):
-    """
-    Render the scene. 
-    
-    Background tensor (bg_color) must be on GPU!
-    """
- 
-    # Create the means2D tensor used to carry screen-space gradients back through
-    # the rasterizer.  Two paths:
-    #
-    #  Stage 2 (GPUGaussianSlice): reuse the pre-allocated _sp_buf / _sp_grad_buf.
-    #    - _sp_buf[:K].detach() shares CUDA storage with the permanent buffer —
-    #      zero new allocation.  requires_grad_(True) makes it a leaf so .grad is
-    #      stored automatically (no retain_grad() needed).
-    #    - Pre-wiring .grad = _sp_grad_buf[:K] prevents PyTorch allocating a
-    #      separate gradient tensor during backward (it accumulates in-place).
-    #
-    #  Stage 1 (GaussianModel): original path unchanged.
-    if hasattr(pc, '_sp_buf'):
-        K = pc.get_xyz.shape[0]
-        screenspace_points = pc._sp_buf[:K].detach().requires_grad_(True)
-        screenspace_points.grad = pc._sp_grad_buf[:K]
-    else:
-        screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
-        try:
-            screenspace_points.retain_grad()
-        except:
-            pass
 
-    # Set up rasterization configuration
+def render(viewpoint_camera, pc, pipe, bg_color: torch.Tensor,
+           scaling_modifier: float = 1.0, separate_sh: bool = False,
+           override_color=None, use_trained_exp: bool = False):
+    """
+    Render the scene using gsplat.
+
+    Drop-in replacement for the diff-gaussian-rasterization renderer.
+    bg_color must be a (3,) GPU tensor.
+
+    Key differences from the original renderer:
+      - Uses gsplat.rasterization() instead of GaussianRasterizer.
+      - Activations (exp, sigmoid, normalize) are applied in Python before
+        the kernel call — gsplat expects already-activated values.
+      - world_view_transform is stored as W2C^T (column-major for CUDA);
+        gsplat expects the actual W2C matrix, so we transpose it here.
+      - packed=True: intermediate results are sparse, saving memory for
+        large scenes where each camera sees only a subset of Gaussians.
+      - Output render_colors is (C, H, W, 3) NHWC; we permute to (3, H, W).
+    """
+    H = int(viewpoint_camera.image_height)
+    W = int(viewpoint_camera.image_width)
+    device = bg_color.device
+
+    # --- Intrinsics matrix K from FoV ---
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+    fx = W / (2.0 * tanfovx)
+    fy = H / (2.0 * tanfovy)
+    Ks = torch.tensor(
+        [[fx,  0.0, W / 2.0],
+         [0.0, fy,  H / 2.0],
+         [0.0, 0.0, 1.0]],
+        dtype=torch.float32, device=device,
+    ).unsqueeze(0)  # (1, 3, 3)
 
-    raster_settings = GaussianRasterizationSettings(
-        image_height=int(viewpoint_camera.image_height),
-        image_width=int(viewpoint_camera.image_width),
-        tanfovx=tanfovx,
-        tanfovy=tanfovy,
-        bg=bg_color,
-        scale_modifier=scaling_modifier,
-        viewmatrix=viewpoint_camera.world_view_transform,
-        projmatrix=viewpoint_camera.full_proj_transform,
-        sh_degree=pc.active_sh_degree,
-        campos=viewpoint_camera.camera_center,
-        prefiltered=False,
-        debug=pipe.debug,
-        antialiasing=False,
+    # --- View matrix ---
+    # world_view_transform is stored as W2C^T (column-major convention for the
+    # original CUDA rasterizer).  gsplat expects the standard row-major W2C
+    # matrix, so we transpose back.
+    viewmats = viewpoint_camera.world_view_transform.T.contiguous().unsqueeze(0)  # (1, 4, 4)
+
+    # --- Gaussian parameters (activations applied before kernel call) ---
+    means     = pc.get_xyz                           # (N, 3)
+    scales    = pc.get_scaling * scaling_modifier    # (N, 3)  exp already applied
+    quats     = pc.get_rotation                      # (N, 4)  normalized
+    opacities = pc.get_opacity.squeeze(-1)           # (N,)
+
+    # --- Colors / SH ---
+    if override_color is not None:
+        colors        = override_color   # (N, 3) pre-computed RGB, sh_degree unused
+        sh_degree_arg = None
+    else:
+        colors        = pc.get_features  # (N, K, 3) SH coefficients; K=1 for degree 0
+        sh_degree_arg = pc.active_sh_degree
+
+    # --- Rasterize ---
+    render_colors, render_alphas, info = rasterization(
+        means=means,
+        quats=quats,
+        scales=scales,
+        opacities=opacities,
+        colors=colors,
+        viewmats=viewmats,
+        Ks=Ks,
+        width=W,
+        height=H,
+        near_plane=viewpoint_camera.znear,
+        far_plane=viewpoint_camera.zfar,
+        backgrounds=bg_color.unsqueeze(0),  # (1, 3)
+        sh_degree=sh_degree_arg,
+        packed=True,
+        radius_clip=0.0,
     )
 
-    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+    # render_colors: (1, H, W, 3) NHWC → (3, H, W) for the rest of the pipeline
+    rendered_image = render_colors[0].permute(2, 0, 1).clamp(0, 1)
 
-    means3D = pc.get_xyz
-    means2D = screenspace_points
-    opacity = pc.get_opacity
-
-    # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
-    # scaling / rotation by the rasterizer.
-    scales = None
-    rotations = None
-    cov3D_precomp = None
-
-    if pipe.compute_cov3D_python:
-        cov3D_precomp = pc.get_covariance(scaling_modifier)
-    else:
-        scales = pc.get_scaling
-        rotations = pc.get_rotation
-
-    # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
-    # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
-    shs = None
-    colors_precomp = None
-    if override_color is None:
-        if pipe.convert_SHs_python:
-            shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
-            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
-            dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
-            sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
-            colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
-        else:
-            if separate_sh:
-                dc, shs = pc.get_features_dc, pc.get_features_rest
-            else:
-                shs = pc.get_features
-    else:
-        colors_precomp = override_color
-
-    # Rasterize visible Gaussians to image, obtain their radii (on screen). 
-    if separate_sh:
-        rendered_image, radii = rasterizer(
-            means3D = means3D,
-            means2D = means2D,
-            dc = dc,
-            shs = shs,
-            colors_precomp = colors_precomp,
-            opacities = opacity,
-            scales = scales,
-            rotations = rotations,
-            cov3D_precomp = cov3D_precomp)
-    else:
-        rendered_image, radii, _ = rasterizer(
-            means3D = means3D,
-            means2D = means2D,
-            shs = shs,
-            colors_precomp = colors_precomp,
-            opacities = opacity,
-            scales = scales,
-            rotations = rotations,
-            cov3D_precomp = cov3D_precomp)
-        
-    # Apply exposure to rendered image (training only)
+    # Apply per-camera exposure (stage 1 only; stage 2 always passes use_trained_exp=False)
     if use_trained_exp:
         exposure = pc.get_exposure_from_name(viewpoint_camera.image_name)
-        rendered_image = torch.matmul(rendered_image.permute(1, 2, 0), exposure[:3, :3]).permute(2, 0, 1) + exposure[:3, 3,   None, None]
+        rendered_image = (
+            torch.matmul(rendered_image.permute(1, 2, 0), exposure[:3, :3])
+            .permute(2, 0, 1)
+            + exposure[:3, 3, None, None]
+        )
 
-    # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
-    # They will be excluded from value updates used in the splitting criteria.
-    rendered_image = rendered_image.clamp(0, 1)
-    out = {
-        "render": rendered_image,
-        "viewspace_points": screenspace_points,
-        "visibility_filter" : (radii > 0).nonzero(),
-        "radii": radii,
-        "depth" : None
-        }
-    
-    return out
+    # Radii: gsplat returns (C, N) per-camera radii in packed mode.
+    # Squeeze the camera dimension for single-camera renders.
+    radii = info.get("radii", torch.zeros(means.shape[0], device=device, dtype=torch.int32))
+    if radii.ndim == 2:
+        radii = radii[0]  # (N,)
+
+    return {
+        "render":            rendered_image,
+        "viewspace_points":  info.get("means2d", means.detach()[:, :2]),
+        "visibility_filter": (radii > 0).nonzero(),
+        "radii":             radii,
+        "depth":             None,
+    }

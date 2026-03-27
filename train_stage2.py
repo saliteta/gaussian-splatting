@@ -16,7 +16,6 @@ import sys
 import uuid
 import torch
 import numpy as np
-from PIL import Image
 from argparse import ArgumentParser, Namespace
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import trange
@@ -211,7 +210,6 @@ def voxel_downsample(xyz: np.ndarray, voxel_size: float) -> np.ndarray:
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations,
              checkpoint_iterations, checkpoint,
-             debug_render_iterations=None,
              voxel_size: float = 0.08,
              iou_sample: int = 500_000,
              batch_size: int = 8,
@@ -407,12 +405,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
     pending_saves         = sorted(set(saving_iterations))
     pending_checks        = sorted(set(checkpoint_iterations))
     pending_evals         = sorted(set(testing_iterations))
-    # 'all' → render every step (inside the per-camera loop)
-    # list  → render only at those milestones
-    if debug_render_iterations is None:
-        debug_render_iterations = []
-    pending_debug_renders = [] if debug_render_iterations == 'all' \
-                            else sorted(set(debug_render_iterations))
 
     def _fire_crossed(pending: list, step: int, action) -> None:
         """Pop and call action(ms) for every milestone ms <= step."""
@@ -460,11 +452,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
                         tb_writer.add_scalar('train/total_loss', loss.item(), global_step)
                     del loss, Ll1
 
-                    if debug_render_iterations == 'all':
-                        if cam.image_name == 'DJI_202512031141_047_DJI_20251203115218_0508_V.JPG':
-                            _save_debug_render(cam, gaussians, pipe, background,
-                                               dataset.model_path, global_step)
-
                     global_step  += 1
                     slot_steps   += 1
                     n_this_round += 1
@@ -484,10 +471,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
             _fire_crossed(pending_evals,  global_step,
                           lambda ms: _eval(scene, gaussians, pipe, background,
                                           tb_writer, ms))
-            _fire_crossed(pending_debug_renders, global_step,
-                          lambda ms: _save_debug_render(
-                              camera_views[0], gaussians, pipe, background,
-                              dataset.model_path, ms))
 
             # Read current LRs from the active optimizer (xyz may have changed via schedule)
             current_lr = {pg['name']: pg['lr'] for pg in gaussians.optimizer.param_groups}
@@ -514,27 +497,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
 # ---------------------------------------------------------------------------
 # Save helpers
 # ---------------------------------------------------------------------------
-
-def _save_debug_render(cam, gaussians, pipe, background, model_path, iteration):
-    """
-    Render one training-view camera with the current GPU slice and save as PNG.
-    Useful to verify Gaussian shape/opacity vs point-cloud appearance.
-    """
-    out_dir  = os.path.join(model_path, "debug_renders")
-    mkdir_p(out_dir)
-    out_path = os.path.join(out_dir, f"iter_{iteration:06d}_{cam.image_name}.png")
-
-    with torch.no_grad():
-        pkg   = render(cam, gaussians, pipe, background,
-                       use_trained_exp=False, separate_sh=False)
-        img   = pkg["render"].clamp(0, 1)           # (3, H, W) float32
-        del pkg
-
-    # Convert to uint8 PIL image and save
-    arr = (img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-    Image.fromarray(arr).save(out_path)
-    print(f"  [debug render] saved → {out_path}")
-
 
 def _flush_and_save(cpu_store, model_path, iteration, is_checkpoint):
     """Flush GPU→CPU (finish_batch already called in loop) and save PLY."""
@@ -617,13 +579,10 @@ if __name__ == "__main__":
                         help="Points randomly subsampled from voxel set for IoU/KNN visibility (coarse)")
     parser.add_argument("--batch_size",       type=int,   default=8,
                         help="Cameras per Gaussian batch (B)")
-    parser.add_argument("--slot_budget_gb",   type=float, default=4.0,
+    parser.add_argument("--slot_budget_gb",   type=float, default=1.5,
                         help="GPU memory budget per Gaussian slot (GB)")
     parser.add_argument("--fov_margin",       type=float, default=0.1,
                         help="FOV expansion margin for visibility frustum")
-    parser.add_argument("--debug_render_iterations", nargs="+", type=str, default=[],
-                        help="Save a debug render PNG at these iteration milestones, "
-                             "or 'all' to render every iteration")
 
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
@@ -642,8 +601,6 @@ if __name__ == "__main__":
         saving_iterations    = args.save_iterations,
         checkpoint_iterations= args.checkpoint_iterations,
         checkpoint              = args.start_checkpoint,
-        debug_render_iterations = 'all' if args.debug_render_iterations == ['all']
-                                          else [int(x) for x in args.debug_render_iterations],
         voxel_size              = args.voxel_size,
         iou_sample           = args.iou_sample,
         batch_size           = args.batch_size,

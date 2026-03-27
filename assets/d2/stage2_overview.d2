@@ -1,0 +1,267 @@
+direction: right
+
+title: "Stage-2 Double-Buffer Training — Full Pipeline" {
+  shape: text
+  style.font-size: 28
+  style.bold: true
+  style.font-color: "#e2e8f0"
+}
+
+# ── INIT PHASE (top band) ──────────────────────────────────────────────────
+
+init: "① Startup / Init" {
+  style.fill: "#1e1b4b"
+  style.stroke: "#818cf8"
+  style.font-color: "#ffffff"
+  style.font-size: 18
+
+  disk: "Disk\nHigh-Res Images\n(JPEG/PNG)" {
+    shape: cylinder
+    style.fill: "#334155"
+    style.stroke: "#94a3b8"
+    style.font-color: "#e2e8f0"
+    style.font-size: 16
+  }
+
+  ply: "Stage-1 PLY\n(GaussianModel)" {
+    shape: cylinder
+    style.fill: "#334155"
+    style.stroke: "#94a3b8"
+    style.font-color: "#e2e8f0"
+    style.font-size: 16
+  }
+
+  cpu_store: "CPUGaussianStore\n(Pinned RAM)\nN×(xyz,f_dc,scale,rot,opa)\n+ Adam state" {
+    style.fill: "#92400e"
+    style.stroke: "#fcd34d"
+    style.font-color: "#ffffff"
+    style.font-size: 16
+  }
+
+  sbi: "SpatialBlockIndex\n(voxel grid → block IDs)" {
+    style.fill: "#1e3a5f"
+    style.stroke: "#60a5fa"
+    style.font-color: "#ffffff"
+    style.font-size: 16
+  }
+
+  vis: "VisibilityPrecomputer\n(cam × block bitmask)" {
+    style.fill: "#1e3a5f"
+    style.stroke: "#60a5fa"
+    style.font-color: "#ffffff"
+    style.font-size: 16
+  }
+
+  sched: "CameraBatchScheduler\n(batch_infos: anchor→blocks,cameras)" {
+    style.fill: "#1e3a5f"
+    style.stroke: "#60a5fa"
+    style.font-color: "#ffffff"
+    style.font-size: 16
+  }
+
+  cached_cam: "CachedCamera list\n(compressed bytes in RAM)" {
+    style.fill: "#92400e"
+    style.stroke: "#fcd34d"
+    style.font-color: "#ffffff"
+    style.font-size: 16
+  }
+
+  ply -> cpu_store: "pin_memory() copy" { style.stroke: "#fcd34d" }
+  disk -> cached_cam: "read once" { style.stroke: "#94a3b8" }
+  cpu_store -> sbi: "xyz_cpu" { style.stroke: "#60a5fa" }
+  sbi -> vis: "block assign" { style.stroke: "#60a5fa" }
+  vis -> sched: "visible_ds\nds_blocks" { style.stroke: "#60a5fa" }
+}
+
+# ── SWAP BUFFER (center) ───────────────────────────────────────────────────
+
+swap: "② GaussianSwapBuffer\n(Double-Buffer Orchestrator)" {
+  style.fill: "#022c22"
+  style.stroke: "#34d399"
+  style.font-color: "#ffffff"
+  style.font-size: 18
+
+  slot_a: "Slot A — Active\nGPUGaussianSlice\n(params + Adam optimizer\non GPU)" {
+    shape: rectangle
+    style.fill: "#065f46"
+    style.stroke: "#6ee7b7"
+    style.font-color: "#ffffff"
+    style.font-size: 16
+  }
+
+  slot_b: "Slot B — Prefetch\nGPUGaussianSlice\n(loading next batch\nno optimizer yet)" {
+    shape: rectangle
+    style.fill: "#064e3b"
+    style.stroke: "#34d399"
+    style.stroke-dash: 5
+    style.font-color: "#d1fae5"
+    style.font-size: 16
+  }
+
+  img_buf: "GPUImageBufferPacked\n(camera H2D packer)" {
+    shape: oval
+    style.fill: "#1e3a5f"
+    style.stroke: "#60a5fa"
+    style.font-color: "#ffffff"
+    style.font-size: 16
+  }
+
+  prefetch_stream: "CUDA prefetch_stream\n(async H2D)" {
+    shape: oval
+    style.fill: "#1a1a2e"
+    style.stroke: "#a78bfa"
+    style.font-color: "#e9d5ff"
+    style.font-size: 15
+  }
+
+  wb_thread: "Background\nWriteback Thread\n(train_done.sync →\nD2H → CPU scatter\n→ zero-grad Adam\n→ reload async)" {
+    shape: oval
+    style.fill: "#1a1a2e"
+    style.stroke: "#f472b6"
+    style.font-color: "#fce7f3"
+    style.font-size: 15
+  }
+
+  slot_b -> slot_a: "swap when A exhausted\n(finish_batch → active = 1-s)" {
+    style.stroke-dash: 4
+    style.stroke: "#34d399"
+    style.font-size: 14
+  }
+  prefetch_stream -> slot_b: "H2D Gaussian params\n+ camera images" {
+    style.stroke: "#a78bfa"
+    style.font-size: 14
+  }
+  slot_a -> wb_thread: "collect_params()\ncollect_optimizer_state()" {
+    style.stroke: "#f472b6"
+    style.font-size: 14
+  }
+  img_buf -> slot_a: "PackedCameraViews\n(pixel tensors)" {
+    style.stroke: "#60a5fa"
+    style.font-size: 14
+  }
+}
+
+# ── TRAINING LOOP (right) ─────────────────────────────────────────────────
+
+train: "③ Training Loop\n(per camera in batch)" {
+  style.fill: "#1c1917"
+  style.stroke: "#fb923c"
+  style.font-color: "#ffffff"
+  style.font-size: 18
+
+  render: "render()\n(Gaussian splatting\nrasterizer)" {
+    shape: oval
+    style.fill: "#431407"
+    style.stroke: "#fb923c"
+    style.font-color: "#ffffff"
+    style.font-size: 16
+  }
+
+  loss: "FusedLoss\n(L1 + SSIM)\n~125 MB saved tensors\n(int8 sign + ssim_grad)" {
+    shape: diamond
+    style.fill: "#431407"
+    style.stroke: "#fb923c"
+    style.font-color: "#ffffff"
+    style.font-size: 15
+  }
+
+  backprop: "loss.backward()\n+ optimizer.step()\n(Adam, warm-started)" {
+    shape: oval
+    style.fill: "#431407"
+    style.stroke: "#fb923c"
+    style.font-color: "#ffffff"
+    style.font-size: 16
+  }
+
+  render -> loss: "rendered image" { style.stroke: "#fb923c" }
+  loss -> backprop: "grad_pred" { style.stroke: "#fb923c" }
+  backprop -> render: "next camera\n(4 rounds × B cams)" {
+    style.stroke-dash: 4
+    style.stroke: "#fb923c"
+    style.font-size: 14
+  }
+}
+
+# ── WRITEBACK (bottom) ────────────────────────────────────────────────────
+
+wb: "④ Writeback to CPUGaussianStore" {
+  style.fill: "#1c0a00"
+  style.stroke: "#fcd34d"
+  style.font-color: "#ffffff"
+  style.font-size: 18
+
+  d2h: "D2H copy\n(collect_params +\ncollect_optimizer_state)" {
+    style.fill: "#78350f"
+    style.stroke: "#fcd34d"
+    style.font-color: "#ffffff"
+    style.font-size: 16
+  }
+
+  scatter: "cpu_store.scatter()\n+ scatter_adam()\n(update Gaussian rows)" {
+    style.fill: "#78350f"
+    style.stroke: "#fcd34d"
+    style.font-color: "#ffffff"
+    style.font-size: 16
+  }
+
+  zero_adam: "apply_zero_grad_adam()\n(decay non-batch Gaussians\nβ1, β2 steps on CPU)" {
+    style.fill: "#78350f"
+    style.stroke: "#fcd34d"
+    style.font-color: "#ffffff"
+    style.font-size: 16
+  }
+
+  ckpt: "Checkpoint / PLY save\n(save_cpu_store_ply)" {
+    shape: cylinder
+    style.fill: "#334155"
+    style.stroke: "#94a3b8"
+    style.font-color: "#e2e8f0"
+    style.font-size: 16
+  }
+
+  d2h -> scatter: "" { style.stroke: "#fcd34d" }
+  scatter -> zero_adam: "" { style.stroke: "#fcd34d" }
+  zero_adam -> ckpt: "at save milestones" {
+    style.stroke-dash: 4
+    style.stroke: "#94a3b8"
+    style.font-size: 14
+  }
+}
+
+# ── Cross-section edges ───────────────────────────────────────────────────
+
+init.cpu_store -> swap.slot_b: "gather(indices)\n→ H2D prefetch" {
+  style.stroke: "#fcd34d"
+  style.font-color: "#fcd34d"
+  style.font-size: 14
+}
+init.cached_cam -> swap.img_buf: "CachedCamera list" {
+  style.stroke: "#94a3b8"
+  style.font-color: "#94a3b8"
+  style.font-size: 14
+}
+init.sched -> swap: "batch_infos\n(anchor→blocks,cameras)" {
+  style.stroke: "#60a5fa"
+  style.font-color: "#60a5fa"
+  style.font-size: 14
+}
+swap.slot_a -> train.render: "pop() →\n(cam_views, gaussians)" {
+  style.stroke: "#6ee7b7"
+  style.font-color: "#6ee7b7"
+  style.font-size: 14
+}
+train.backprop -> swap: "finish_batch()" {
+  style.stroke: "#fb923c"
+  style.font-color: "#fb923c"
+  style.font-size: 14
+}
+swap.wb_thread -> wb.d2h: "train_done.synchronize()" {
+  style.stroke: "#f472b6"
+  style.font-color: "#f472b6"
+  style.font-size: 14
+}
+wb.scatter -> init.cpu_store: "updated params\n+ Adam state" {
+  style.stroke: "#fcd34d"
+  style.font-color: "#fcd34d"
+  style.font-size: 14
+}

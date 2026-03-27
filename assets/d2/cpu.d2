@@ -1,0 +1,39 @@
+direction: down
+
+CB: "CachedCamera\n(Compressed Bytes)" {
+  shape: rectangle
+  style.fill:        "#fef3c7"
+  style.stroke:      "#d97706"
+  style.stroke-width: 2
+  style.font-color:  "#000000"
+  style.font-size:   20
+}
+
+TP: "ThreadPoolExecutor\n(Parallel CPU Decode)" {
+  shape: oval
+  style.fill:        "#dbeafe"
+  style.stroke:      "#2563eb"
+  style.stroke-width: 2
+  style.font-color:  "#000000"
+  style.font-size:   20
+}
+
+FT: "Decoded Float Tensors\n(Pre-fetched Batch)" {
+  shape: rectangle
+  style.fill:        "#fef3c7"
+  style.stroke:      "#d97706"
+  style.stroke-width: 2
+  style.font-color:  "#000000"
+  style.font-size:   20
+}
+
+CB -> TP: "lazy decode on demand" {
+  style.stroke:      "#d97706"
+  style.font-color:  "#000000"
+  style.font-size:   22
+}
+TP -> FT: "decoded batch ready" {
+  style.stroke:      "#d97706"
+  style.font-color:  "#000000"
+  style.font-size:   22
+}

@@ -1,0 +1,40 @@
+direction: down
+
+SB: "Slot B\n(Prefetching)" {
+  shape: rectangle
+  style.fill:        "#d1fae5"
+  style.stroke:      "#059669"
+  style.stroke-width: 2
+  style.font-color:  "#000000"
+  style.font-size:   20
+}
+
+SA: "Slot A\n(Active)" {
+  shape: rectangle
+  style.fill:        "#d1fae5"
+  style.stroke:      "#059669"
+  style.stroke-width: 2
+  style.font-color:  "#000000"
+  style.font-size:   20
+}
+
+TL: "Training Loop\n(Renders & Back-props)" {
+  shape: oval
+  style.fill:        "#dbeafe"
+  style.stroke:      "#2563eb"
+  style.stroke-width: 2
+  style.font-color:  "#000000"
+  style.font-size:   20
+}
+
+SB -> SA: "swap when A exhausted" {
+  style.stroke-dash: 4
+  style.stroke:      "#059669"
+  style.font-color:  "#000000"
+  style.font-size:   22
+}
+SA -> TL: "feeds pixel data" {
+  style.stroke:      "#059669"
+  style.font-color:  "#000000"
+  style.font-size:   22
+}

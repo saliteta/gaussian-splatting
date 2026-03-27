@@ -1,0 +1,131 @@
+direction: down
+
+title: "Stage-2 Training Loop — Per-Slot Detail" {
+  shape: text
+  style.font-size: 24
+  style.bold: true
+  style.font-color: "#e2e8f0"
+}
+
+loop_outer: "Outer Loop: while global_step < iterations" {
+  style.fill: "#1c1917"
+  style.stroke: "#78716c"
+  style.font-color: "#e7e5e4"
+  style.font-size: 16
+
+  pop: "swap_buffer.pop()\n———————————————\n• wait slot_ready[active]\n  (CUDA stream-level)\n• ensure_optimizer()\n  (lazy Adam creation)\n• return (cam_views, gaussians)" {
+    shape: oval
+    style.fill: "#292524"
+    style.stroke: "#fb923c"
+    style.font-color: "#fff7ed"
+    style.font-size: 14
+  }
+
+  round_loop: "Round Loop (4 rounds)" {
+    style.fill: "#1c1917"
+    style.stroke: "#fb923c"
+    style.stroke-dash: 4
+    style.font-color: "#fdba74"
+    style.font-size: 15
+
+    lr_update: "Update xyz LR\n(xyz_lr_fn(global_step)\nonce per round)" {
+      style.fill: "#292524"
+      style.stroke: "#fb923c"
+      style.font-color: "#fff7ed"
+      style.font-size: 13
+    }
+
+    cam_loop: "Camera Loop (B cameras)" {
+      style.fill: "#1a1614"
+      style.stroke: "#f97316"
+      style.stroke-dash: 4
+      style.font-color: "#fdba74"
+      style.font-size: 14
+
+      render: "render(cam, gaussians,\n  pipe, background)\n→ render_pkg['render']" {
+        shape: oval
+        style.fill: "#431407"
+        style.stroke: "#fb923c"
+        style.font-color: "#ffffff"
+        style.font-size: 13
+      }
+
+      loss_fn: "FusedLoss.apply(\n  rendered, gt_image,\n  lambda_dssim)\n→ loss, Ll1\n\nSaves only:\n  int8 sign (25MB)\n  ssim_grad (100MB)\n  [vs ~1100MB naive]" {
+        shape: diamond
+        style.fill: "#431407"
+        style.stroke: "#fb923c"
+        style.font-color: "#ffffff"
+        style.font-size: 13
+      }
+
+      backward: "loss.backward()\ngradients accumulate\nin nn.Parameter views\n([:K] of GPU buffers)" {
+        shape: oval
+        style.fill: "#431407"
+        style.stroke: "#fb923c"
+        style.font-color: "#ffffff"
+        style.font-size: 13
+      }
+
+      step: "optimizer.step()\noptimizer.zero_grad(\n  set_to_none=True)" {
+        shape: oval
+        style.fill: "#431407"
+        style.stroke: "#fb923c"
+        style.font-color: "#ffffff"
+        style.font-size: 13
+      }
+
+      counters: "global_step += 1\nslot_steps += 1\ntb_writer.add_scalar()" {
+        style.fill: "#292524"
+        style.stroke: "#78716c"
+        style.font-color: "#e7e5e4"
+        style.font-size: 13
+      }
+
+      render -> loss_fn: "image (3×H×W float16)" { style.stroke: "#fb923c" }
+      loss_fn -> backward: "scalar loss" { style.stroke: "#fb923c" }
+      backward -> step: "" { style.stroke: "#fb923c" }
+      step -> counters: "" { style.stroke: "#fb923c" }
+      counters -> render: "next cam" {
+        style.stroke-dash: 4
+        style.stroke: "#78716c"
+        style.font-size: 12
+      }
+    }
+
+    lr_update -> cam_loop: "" { style.stroke: "#fb923c" }
+  }
+
+  milestone: "Milestone Checks\n(_fire_crossed)\n• checkpoint save\n• PLY save\n• eval PSNR" {
+    shape: diamond
+    style.fill: "#292524"
+    style.stroke: "#60a5fa"
+    style.font-color: "#bfdbfe"
+    style.font-size: 14
+  }
+
+  finish: "swap_buffer.finish_batch(\n  global_step, slot_steps,\n  current_lr_dict)\n———————————————\n• record train_done event\n• active = 1 - s  (swap NOW)\n• launch bg writeback thread:\n    sync → D2H → scatter\n    → zero_grad_adam\n    → _load_slot_async(next)\n• join PREV wb_thread" {
+    style.fill: "#022c22"
+    style.stroke: "#34d399"
+    style.font-color: "#d1fae5"
+    style.font-size: 14
+  }
+
+  pop -> round_loop: "" { style.stroke: "#fb923c" }
+  round_loop -> milestone: "4 rounds done" { style.stroke: "#fb923c" }
+  milestone -> finish: "" { style.stroke: "#78716c" }
+  finish -> pop: "next slot" {
+    style.stroke-dash: 4
+    style.stroke: "#34d399"
+    style.font-size: 13
+  }
+}
+
+final_save: "Final PLY Save\n(save_cpu_store_ply)" {
+  shape: cylinder
+  style.fill: "#334155"
+  style.stroke: "#94a3b8"
+  style.font-color: "#e2e8f0"
+  style.font-size: 15
+}
+
+loop_outer -> final_save: "global_step ≥ iterations" { style.stroke: "#94a3b8" }

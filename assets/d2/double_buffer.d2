@@ -1,0 +1,125 @@
+direction: down
+
+title: "GaussianSwapBuffer — Double-Buffer Swap Lifecycle" {
+  shape: text
+  style.font-size: 26
+  style.bold: true
+  style.font-color: "#e2e8f0"
+}
+
+# ── Time flows left → right ───────────────────────────────────────────────
+# We show three sequential phases across columns.
+
+phase1: "Phase 1 — Initial Prefetch\n(prefetch_initial)" {
+  direction: right
+  style.fill: "#0f172a"
+  style.stroke: "#475569"
+  style.font-color: "#cbd5e1"
+  style.font-size: 18
+
+  slot0a: "Slot 0 (active)\nload_from(anchor0)\n[sync H2D]" {
+    style.fill: "#065f46"
+    style.stroke: "#6ee7b7"
+    style.font-color: "#ffffff"
+    style.font-size: 15
+  }
+  slot1a: "Slot 1 (inactive)\nload_from(anchor1)\n[sync H2D]" {
+    style.fill: "#064e3b"
+    style.stroke: "#34d399"
+    style.stroke-dash: 5
+    style.font-color: "#d1fae5"
+    style.font-size: 15
+  }
+  slot0a -> slot1a: "active = 0" {
+    style.stroke: "#475569"
+    style.font-size: 13
+  }
+}
+
+phase2: "Phase 2 — pop() + Training\n(4 rounds × B cameras)" {
+  direction: right
+  style.fill: "#1c1917"
+  style.stroke: "#fb923c"
+  style.font-color: "#ffffff"
+  style.font-size: 18
+
+  pop: "pop(slot 0)\nwait slot_ready[0]\nensure_optimizer()" {
+    shape: oval
+    style.fill: "#431407"
+    style.stroke: "#fb923c"
+    style.font-color: "#ffffff"
+    style.font-size: 15
+  }
+  gpu_train: "GPU Training\nrender → loss → backward\n→ optimizer.step()\n(repeated B×4 times)" {
+    style.fill: "#431407"
+    style.stroke: "#fb923c"
+    style.font-color: "#ffffff"
+    style.font-size: 15
+  }
+  slot1b: "Slot 1\n(idle, ready)\nno optimizer yet\n(saves ~3.4 GB)" {
+    style.fill: "#064e3b"
+    style.stroke: "#34d399"
+    style.stroke-dash: 5
+    style.font-color: "#d1fae5"
+    style.font-size: 15
+  }
+  pop -> gpu_train: "cam_views + gaussians" { style.stroke: "#fb923c" }
+  gpu_train -> slot1b: "(waiting its turn)" {
+    style.stroke-dash: 4
+    style.stroke: "#475569"
+    style.font-size: 12
+  }
+}
+
+phase3: "Phase 3 — finish_batch()\n(slot swap + async writeback)" {
+  direction: right
+  style.fill: "#0f172a"
+  style.stroke: "#a78bfa"
+  style.font-color: "#e9d5ff"
+  style.font-size: 18
+
+  record_evt: "record train_done\n(CUDA event on\ncompute stream)" {
+    shape: oval
+    style.fill: "#2d1b69"
+    style.stroke: "#a78bfa"
+    style.font-color: "#e9d5ff"
+    style.font-size: 15
+  }
+  swap_active: "active = 1\n(slot 1 becomes active\nimmediately — no stall)" {
+    shape: diamond
+    style.fill: "#2d1b69"
+    style.stroke: "#a78bfa"
+    style.font-color: "#e9d5ff"
+    style.font-size: 15
+  }
+  bg_thread: "Background Thread\n───────────────\n① train_done.synchronize()\n② D2H collect_params()\n③ cpu_store.scatter()\n④ scatter_adam()\n⑤ apply_zero_grad_adam()\n   (non-batch Gaussians)\n⑥ _load_slot_async(0, next)\n   (H2D on prefetch_stream)" {
+    style.fill: "#1a1a2e"
+    style.stroke: "#f472b6"
+    style.font-color: "#fce7f3"
+    style.font-size: 14
+  }
+  pop2: "pop(slot 1)\nwait slot_ready[1]\nensure_optimizer()" {
+    shape: oval
+    style.fill: "#431407"
+    style.stroke: "#fb923c"
+    style.font-color: "#ffffff"
+    style.font-size: 15
+  }
+
+  record_evt -> swap_active: "" { style.stroke: "#a78bfa" }
+  swap_active -> bg_thread: "Thread.start()" { style.stroke: "#f472b6" }
+  swap_active -> pop2: "compute stream\ncontinues on slot 1" {
+    style.stroke: "#fb923c"
+    style.font-size: 13
+  }
+}
+
+# ── Vertical flow between phases ─────────────────────────────────────────
+
+phase1 -> phase2: "" { style.stroke: "#475569" }
+phase2 -> phase3: "all cameras exhausted" { style.stroke: "#fb923c" }
+phase3 -> phase2: "next iteration:\npop(slot 1) → train" {
+  style.stroke-dash: 4
+  style.stroke: "#34d399"
+  style.font-size: 13
+}

@@ -35,16 +35,6 @@ class GPUGaussianSlice(nn.Module):
         self._rotation_buf    = torch.empty(max_gaussians, 4,    device=self.device)
         self._opacity_buf     = torch.empty(max_gaussians, 1,    device=self.device)
 
-        # Level 2 memory control: reusable screenspace buffers for render().
-        # render() normally calls torch.zeros_like(xyz) + 0 each forward pass,
-        # allocating and freeing K×3×4 bytes (~460 MB at 38 M Gaussians) 32×
-        # per batch — a prime fragmentation source.  These permanent buffers are
-        # sliced [:K] and detached each call, so no new CUDA memory is ever
-        # requested.  _sp_grad_buf is pre-wired as screenspace_points.grad to
-        # prevent PyTorch allocating a separate grad tensor during backward.
-        self._sp_buf      = torch.zeros(max_gaussians, 3, device=self.device)
-        self._sp_grad_buf = torch.zeros(max_gaussians, 3, device=self.device)
-
         self.valid_length: int              = 0
         self.cpu_indices:  np.ndarray       = np.empty(0, dtype=np.int64)
         self.optimizer:    Optional[torch.optim.Optimizer] = None
