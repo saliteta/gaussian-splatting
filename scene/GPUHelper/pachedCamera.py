@@ -26,3 +26,5 @@ class PackedCameraView:
     camera_center: torch.Tensor           # (3,)
 
     cpu_camera: Optional[Any] = None
+    cx: Optional[float] = None   # principal point x (scaled); None → use image_width/2
+    cy: Optional[float] = None   # principal point y (scaled); None → use image_height/2

@@ -57,7 +57,7 @@ class Camera(nn.Module):
         self.image_width = self.original_image.shape[2]
         self.image_height = self.original_image.shape[1]
 
-        self.zfar = 100.0
+        self.zfar = 2000.0
         self.znear = 0.01
 
         self.trans = trans

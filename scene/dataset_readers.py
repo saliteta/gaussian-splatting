@@ -22,6 +22,7 @@ from pathlib import Path
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
+from tqdm import tqdm
 
 class CameraInfo(NamedTuple):
     uid: int
@@ -34,6 +35,8 @@ class CameraInfo(NamedTuple):
     width: int
     height: int
     is_test: bool
+    cx: float = None   # principal point x in pixels; None → assume width/2
+    cy: float = None   # principal point y in pixels; None → assume height/2
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -68,11 +71,7 @@ def getNerfppNorm(cam_info):
 
 def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, test_cam_names_list):
     cam_infos = []
-    for idx, key in enumerate(cam_extrinsics):
-        sys.stdout.write('\r')
-        # the exact output you're looking for:
-        sys.stdout.write("Reading camera {}/{}".format(idx+1, len(cam_extrinsics)))
-        sys.stdout.flush()
+    for idx, key in enumerate(tqdm(cam_extrinsics, desc="Reading cameras info", total=len(cam_extrinsics))):
 
         extr = cam_extrinsics[key]
         intr = cam_intrinsics[extr.camera_id]
@@ -85,11 +84,13 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, test_cam_na
 
         if intr.model=="SIMPLE_PINHOLE":
             focal_length_x = intr.params[0]
+            cx, cy = intr.params[1], intr.params[2]
             FovY = focal2fov(focal_length_x, height)
             FovX = focal2fov(focal_length_x, width)
         elif intr.model=="PINHOLE":
             focal_length_x = intr.params[0]
             focal_length_y = intr.params[1]
+            cx, cy = intr.params[2], intr.params[3]
             FovY = focal2fov(focal_length_y, height)
             FovX = focal2fov(focal_length_x, width)
         else:
@@ -100,7 +101,8 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, test_cam_na
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX,
                               image_path=image_path, image_name=image_name,
-                              width=width, height=height, is_test=image_name in test_cam_names_list)
+                              width=width, height=height, is_test=image_name in test_cam_names_list,
+                              cx=float(cx), cy=float(cy))
         cam_infos.append(cam_info)
 
     sys.stdout.write('\n')
@@ -111,7 +113,11 @@ def fetchPly(path):
     vertices = plydata['vertex']
     positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
     colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
-    normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
+    prop_names = {p.name for p in vertices.properties}
+    if {'nx', 'ny', 'nz'}.issubset(prop_names):
+        normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
+    else:
+        normals = np.zeros_like(positions)
     return BasicPointCloud(points=positions, colors=colors, normals=normals)
 
 def storePly(path, xyz, rgb):
@@ -174,6 +180,7 @@ def readColmapSceneInfo(path, images, eval, train_test_exp, llffhold=8):
     ply_path = os.path.join(path, "sparse/0/points3D.ply")
     bin_path = os.path.join(path, "sparse/0/points3D.bin")
     txt_path = os.path.join(path, "sparse/0/points3D.txt")
+    print(f"Reading point cloud from {ply_path}")
     if not os.path.exists(ply_path):
         print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
         try:

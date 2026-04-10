@@ -78,6 +78,11 @@ def loadCam(
         orig_size=(orig_w, orig_h),
     )
 
+    # Scale cx/cy from original image space to the target resolution.
+    # ratio = target_pixels / original_pixels, same for both axes (uniform scale).
+    cx_scaled = cam_info.cx * (resolution[0] / orig_w) if getattr(cam_info, 'cx', None) is not None else None
+    cy_scaled = cam_info.cy * (resolution[1] / orig_h) if getattr(cam_info, 'cy', None) is not None else None
+
     # Note: Camera expects resolution as (W,H) as used throughout this repo.
     return CachedCamera(
         uid=id,
@@ -93,6 +98,8 @@ def loadCam(
         train_test_exp=args.train_test_exp,
         is_test_dataset=is_test_dataset,
         is_test_view=cam_info.is_test,
+        cx=cx_scaled,
+        cy=cy_scaled,
     )
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args, is_test_dataset)->List[Camera]:

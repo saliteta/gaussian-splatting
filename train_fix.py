@@ -194,6 +194,11 @@ def training(dataset, opt, pipe, low_intensity_cfg, testing_iterations, saving_i
 
     camera_loader: GPUImageBufferPacked = scene.getTrainCameras(current_stage.scale)
 
+    # Fixed camera for progress renders (first train camera, used every 10 iters)
+    progress_dir = os.path.join(dataset.model_path, "progress")
+    os.makedirs(progress_dir, exist_ok=True)
+    _fixed_cam = scene.train_cameras[training_stages[0].scale][0]
+
     first_iter += 1
     for iteration in trange(first_iter, opt.iterations + 1):
         iteration_stage = get_stage_for_iteration(iteration, training_stages)
@@ -277,6 +282,17 @@ def training(dataset, opt, pipe, low_intensity_cfg, testing_iterations, saving_i
                 else:
                     gaussians.optimizer.step()
                     gaussians.optimizer.zero_grad(set_to_none = True)
+
+            if iteration % 10 == 0:
+                prog_img = render(
+                    _fixed_cam, gaussians, pipe, background,
+                    use_trained_exp=dataset.train_test_exp,
+                    separate_sh=SPARSE_ADAM_AVAILABLE,
+                )["render"].clamp(0, 1)
+                torchvision.utils.save_image(
+                    prog_img, os.path.join(progress_dir, f"iter_{iteration:06d}.png")
+                )
+                del prog_img
 
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))

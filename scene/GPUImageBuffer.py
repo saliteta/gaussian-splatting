@@ -198,6 +198,8 @@ class GPUImageBufferPacked:
                 zfar=cam.zfar,
                 image_width=cam.image_width,
                 image_height=cam.image_height,
+                cx=getattr(cam, 'cx', None),
+                cy=getattr(cam, 'cy', None),
 
                 original_image=img_gpu[i],   # view
                 alpha_mask=msk_gpu[i],       # view
@@ -302,6 +304,8 @@ class GPUImageBufferPacked:
                 zfar=cam.zfar,
                 image_width=cam.image_width,
                 image_height=cam.image_height,
+                cx=getattr(cam, 'cx', None),
+                cy=getattr(cam, 'cy', None),
                 original_image=img_gpu[i],
                 alpha_mask=msk_gpu[i],
                 world_view_transform=wv_gpu[i],

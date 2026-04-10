@@ -21,6 +21,7 @@ from utils.camera_utils import cameraList_from_camInfos, cameraList_from_camInfo
 from scene.GPUImageBuffer import GPUImageBufferPacked
 import torch
 from concurrent.futures import ThreadPoolExecutor
+from tqdm import tqdm
 """
     The modification is like the following: 
         - We added an additional buffer loader for different resolution and cameras
@@ -94,7 +95,7 @@ class Scene:
         # This avoids duplicating compressed data 4x when using coarse-to-fine schedules.
         def _preload(cam_infos):
             out = {}
-            for c in cam_infos:
+            for c in tqdm(cam_infos, desc="Preloading cameras from disk", total=len(cam_infos)):
                 p = str(c.image_path)
                 if p in out:
                     continue

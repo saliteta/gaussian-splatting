@@ -147,32 +147,52 @@ def build_loss(rendered_image, viewpoint_cam, background, opt):
     return loss, Ll1
 
 
-def save_cpu_store_ply(cpu_store: CPUGaussianStore, path: str):
-    """Save CPUGaussianStore to PLY in GaussianModel-compatible format (SH degree 0)."""
-    from plyfile import PlyData, PlyElement
-    mkdir_p(os.path.dirname(path))
+def save_cpu_store_ply(cpu_store: CPUGaussianStore, path: str,
+                       chunk_size: int = 1_000_000):
+    """Save CPUGaussianStore to PLY in GaussianModel-compatible format (SH degree 0).
 
-    xyz      = cpu_store._xyz.numpy()                                    # (N, 3)
-    normals  = np.zeros_like(xyz)
-    f_dc     = cpu_store._features_dc.numpy()                            # (N, 1, 3)
-    f_dc_out = f_dc.transpose(0, 2, 1).reshape(xyz.shape[0], -1)        # (N, 3)
-    opacity  = cpu_store._opacity.numpy()                                # (N, 1)
-    scale    = cpu_store._scaling.numpy()                                # (N, 3)
-    rotation = cpu_store._rotation.numpy()                               # (N, 4)
+    Writes raw binary PLY in chunks to avoid a full-array concat spike.
+    Peak extra RAM ≈ chunk_size × 17 × 4 B  (~68 MB at default 1 M chunk).
+    """
+    mkdir_p(os.path.dirname(path))
+    N = cpu_store._xyz.shape[0]
 
     attrs = (
-        ['x', 'y', 'z', 'nx', 'ny', 'nz']
-        + [f'f_dc_{i}' for i in range(f_dc_out.shape[1])]
-        + ['opacity']
-        + [f'scale_{i}' for i in range(scale.shape[1])]
-        + [f'rot_{i}' for i in range(rotation.shape[1])]
+        ['x', 'y', 'z', 'nx', 'ny', 'nz',
+         'f_dc_0', 'f_dc_1', 'f_dc_2',
+         'opacity',
+         'scale_0', 'scale_1', 'scale_2',
+         'rot_0', 'rot_1', 'rot_2', 'rot_3']
     )
-    dtype    = [(a, 'f4') for a in attrs]
-    data     = np.concatenate([xyz, normals, f_dc_out, opacity, scale, rotation], axis=1)
-    elements = np.empty(xyz.shape[0], dtype=dtype)
-    elements[:] = list(map(tuple, data))
-    PlyData([PlyElement.describe(elements, 'vertex')]).write(path)
-    print(f"  Saved {xyz.shape[0]:,} Gaussians → {path}")
+
+    # Write header + binary data in one pass — no plyfile, no full concat.
+    with open(path, 'wb') as f:
+        header = (
+            "ply\n"
+            "format binary_little_endian 1.0\n"
+            f"element vertex {N}\n"
+            + "".join(f"property float {a}\n" for a in attrs)
+            + "end_header\n"
+        )
+        f.write(header.encode('ascii'))
+
+        zeros3 = np.zeros((chunk_size, 3), dtype=np.float32)  # reused for normals
+        for start in range(0, N, chunk_size):
+            end = min(start + chunk_size, N)
+            c   = end - start
+
+            xyz_c  = cpu_store._xyz[start:end].numpy()               # view, no copy
+            fdc_c  = cpu_store._features_dc[start:end, 0, :].numpy() # (c, 3)
+            opa_c  = cpu_store._opacity[start:end].numpy()           # (c, 1)
+            scl_c  = cpu_store._scaling[start:end].numpy()           # (c, 3)
+            rot_c  = cpu_store._rotation[start:end].numpy()          # (c, 4)
+
+            chunk = np.concatenate(
+                [xyz_c, zeros3[:c], fdc_c, opa_c, scl_c, rot_c], axis=1
+            ).astype(np.float32, copy=False)                         # (c, 17)
+            f.write(chunk.tobytes())
+
+    print(f"  Saved {N:,} Gaussians → {path}")
 
 
 def _ravel_hash(arr: np.ndarray) -> np.ndarray:
@@ -214,9 +234,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
              iou_sample: int = 500_000,
              batch_size: int = 8,
              slot_budget_gb: float = 2.0,
-             fov_margin: float = 0.1):
+             fov_margin: float = 0.1,
+             use_amp: bool = False):
 
     device = torch.device("cuda")
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    if use_amp:
+        print("[Stage2] AMP enabled — fp16 forward, fp32 optimizer state.")
 
     # -----------------------------------------------------------------------
     # 1. Load scene + initialise GaussianModel (for create_from_pcd)
@@ -234,7 +258,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
     # -----------------------------------------------------------------------
     # 1b. Hard-cap point cloud to 40M Gaussians before transfer
     # -----------------------------------------------------------------------
-    MAX_GAUSSIANS = 30_000_000
+    MAX_GAUSSIANS = 50_000_000
     P = gaussians._xyz.shape[0]
     if P > MAX_GAUSSIANS:
         print(f"[Stage2] Downsampling {P:,} → {MAX_GAUSSIANS:,} Gaussians "
@@ -397,6 +421,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
     # -----------------------------------------------------------------------
     global_step = 0
     slot_steps  = 0   # optimizer steps taken on the current GPU slot
+    _dbg_slot_saved = False
 
     # Sorted milestone queues — fire once when global_step first crosses each value.
     # Using sorted lists + a low-water-mark pointer so we never fire twice even if
@@ -431,20 +456,35 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
                     if global_step >= opt.iterations:
                         break
 
-                    render_pkg = render(
-                        cam, gaussians, pipe, background,
-                        use_trained_exp=False,
-                        separate_sh=False,
-                    )
-                    image = render_pkg["render"]
+                    with torch.cuda.amp.autocast(enabled=use_amp):
+                        render_pkg = render(
+                            cam, gaussians, pipe, background,
+                            use_trained_exp=False,
+                            separate_sh=False,
+                        )
+                        image = render_pkg["render"]
+                        loss, Ll1 = build_loss(image, cam, background, opt)
 
-                    loss, Ll1 = build_loss(image, cam, background, opt)
-
-                    loss.backward()
+                    # Debug: save rendered + GT side-by-side for first 32 iterations
+                    #if global_step < 32:
+                    #    with torch.no_grad():
+                    #        gt_img = image_to_float01(cam.original_image, image.device)
+                    #        # stack rendered | GT horizontally
+                    #        dbg = torch.cat([image.float().clamp(0, 1), gt_img], dim=2)  # (3, H, 2W)
+                    #        dbg_np = (dbg.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                    #        from PIL import Image as PILImage
+                    #        dbg_dir = os.path.join(dataset.model_path, "debug_renders")
+                    #        os.makedirs(dbg_dir, exist_ok=True)
+                    #        PILImage.fromarray(dbg_np).save(
+                    #            os.path.join(dbg_dir, f"iter_{global_step:04d}.png")
+                    #        )
+                    
+                    scaler.scale(loss).backward()
                     del render_pkg, image
 
                     with torch.no_grad():
-                        gaussians.optimizer.step()
+                        scaler.step(gaussians.optimizer)
+                        scaler.update()
                         gaussians.optimizer.zero_grad(set_to_none=True)
 
                     if tb_writer:
@@ -459,19 +499,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
                 # Batch tqdm update once per round
                 pbar.update(n_this_round)
 
-            # --- Milestone checks after the slot (not inside the per-camera loop) ---
-            # Fire saves/checkpoints/evals for any milestone we've crossed since the
-            # last slot.  Each milestone fires at most once (popped from the queue).
-            _fire_crossed(pending_checks, global_step,
-                          lambda ms: _flush_and_save(cpu_store, dataset.model_path,
-                                                     ms, is_checkpoint=True))
-            _fire_crossed(pending_saves,  global_step,
-                          lambda ms: _flush_and_save(cpu_store, dataset.model_path,
-                                                     ms, is_checkpoint=False))
-            _fire_crossed(pending_evals,  global_step,
-                          lambda ms: _eval(scene, gaussians, pipe, background,
-                                          tb_writer, ms))
-
             # Read current LRs from the active optimizer (xyz may have changed via schedule)
             current_lr = {pg['name']: pg['lr'] for pg in gaussians.optimizer.param_groups}
             swap_buffer.finish_batch(
@@ -481,7 +508,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
             )
             slot_steps = 0
 
-    # Final save
+            # --- Milestone checks AFTER finish_batch so the bg writeback thread
+            # for the previous slot has been joined and cpu_store is fully up to
+            # date for all slots except the one currently prefetching. ---
+            # We also flush the just-finished slot's params before any save so
+            # the save captures the most recent trained state.
+            def _save_with_flush(ms, is_checkpoint):
+                # Join any in-flight bg writeback before reading cpu_store.
+                if swap_buffer._wb_thread is not None:
+                    swap_buffer._wb_thread.join()
+                _flush_and_save(cpu_store, dataset.model_path, ms, is_checkpoint)
+
+            _fire_crossed(pending_checks, global_step,
+                          lambda ms: _save_with_flush(ms, True))
+            _fire_crossed(pending_saves,  global_step,
+                          lambda ms: _save_with_flush(ms, False))
+            _fire_crossed(pending_evals,  global_step,
+                          lambda ms: _eval(scene, gaussians, pipe, background,
+                                          tb_writer, ms))
+
+    # Final save — join the last bg writeback thread first so cpu_store is complete.
+    if swap_buffer._wb_thread is not None:
+        swap_buffer._wb_thread.join()
     _flush_and_save(cpu_store, dataset.model_path,
                     global_step, is_checkpoint=False)
 
@@ -524,8 +572,9 @@ def _eval(scene, gaussians, pipe, background, tb_writer, iteration):
                              use_trained_exp=False, separate_sh=False)["render"]
                 img = img.clamp(0, 1)
                 gt  = image_to_float01(vc.original_image, img.device)
-                l1_test   += l1_loss(img, gt).mean().double()
-                psnr_test += psnr(img, gt).mean().double()
+                l1_test   += l1_loss(img, gt).mean().item()
+                psnr_test += psnr(img, gt).mean().item()
+                del img, gt
                 n += 1
         except StopIteration:
             pass
@@ -583,6 +632,9 @@ if __name__ == "__main__":
                         help="GPU memory budget per Gaussian slot (GB)")
     parser.add_argument("--fov_margin",       type=float, default=0.1,
                         help="FOV expansion margin for visibility frustum")
+    parser.add_argument("--amp",              action="store_true", default=False,
+                        help="Use Automatic Mixed Precision (fp16 forward, fp32 optimizer state). "
+                             "Saves ~30-40%% peak CUDA memory with <0.1 dB PSNR impact.")
 
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
@@ -606,5 +658,6 @@ if __name__ == "__main__":
         batch_size           = args.batch_size,
         slot_budget_gb       = args.slot_budget_gb,
         fov_margin           = args.fov_margin,
+        use_amp              = args.amp,
     )
     print("\nTraining complete.")

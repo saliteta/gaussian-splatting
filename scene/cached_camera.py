@@ -49,6 +49,8 @@ class CachedCamera(torch.nn.Module):
         is_test_view: bool = False,
         trans: np.ndarray = np.array([0.0, 0.0, 0.0]),
         scale: float = 1.0,
+        cx: float = None,   # principal point x in scaled-resolution pixels; None → W/2
+        cy: float = None,   # principal point y in scaled-resolution pixels; None → H/2
     ):
         super().__init__()
 
@@ -59,6 +61,8 @@ class CachedCamera(torch.nn.Module):
         self.FoVx = FoVx
         self.FoVy = FoVy
         self.image_name = image_name
+        self.cx = cx
+        self.cy = cy
 
         try:
             self.data_device = torch.device(data_device)
@@ -72,7 +76,7 @@ class CachedCamera(torch.nn.Module):
         self.image_width = int(self._resolution[0])
         self.image_height = int(self._resolution[1])
 
-        self.zfar = 100.0
+        self.zfar = 2000.0
         self.znear = 0.01
         self.trans = trans
         self.scale = scale

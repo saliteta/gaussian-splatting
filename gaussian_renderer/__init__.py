@@ -1,9 +1,10 @@
 import math
 import torch
 from gsplat import rasterization
+from scene.GPUHelper.pachedCamera import PackedCameraView
 
 
-def render(viewpoint_camera, pc, pipe, bg_color: torch.Tensor,
+def render(viewpoint_camera: PackedCameraView, pc, pipe, bg_color: torch.Tensor,
            scaling_modifier: float = 1.0, separate_sh: bool = False,
            override_color=None, use_trained_exp: bool = False):
     """
@@ -26,14 +27,19 @@ def render(viewpoint_camera, pc, pipe, bg_color: torch.Tensor,
     W = int(viewpoint_camera.image_width)
     device = bg_color.device
 
-    # --- Intrinsics matrix K from FoV ---
+    # --- Intrinsics matrix K from FoV + principal point ---
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
     fx = W / (2.0 * tanfovx)
     fy = H / (2.0 * tanfovy)
+    # Use the actual principal point if available; fall back to image centre.
+    cx = getattr(viewpoint_camera, 'cx', None)
+    cy = getattr(viewpoint_camera, 'cy', None)
+    cx = cx if cx is not None else W / 2.0
+    cy = cy if cy is not None else H / 2.0
     Ks = torch.tensor(
-        [[fx,  0.0, W / 2.0],
-         [0.0, fy,  H / 2.0],
+        [[fx,  0.0, cx],
+         [0.0, fy,  cy],
          [0.0, 0.0, 1.0]],
         dtype=torch.float32, device=device,
     ).unsqueeze(0)  # (1, 3, 3)
